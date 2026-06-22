@@ -1,0 +1,13 @@
+{
+  "task": "graph",
+  "heldout_domain": "political",
+  "supported": false,
+  "evaluated_datasets": [],
+  "configured_datasets": [
+    "house_committees"
+  ],
+  "incompatible_datasets": [
+    "house_committees"
+  ],
+  "reason": "The current DHG environment does not expose graph-level datasets with per-graph labels and train/val/test splits."
+}

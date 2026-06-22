@@ -10,7 +10,6 @@ import torch.nn.functional as F
 from trainers.downstream_base import DownstreamTrainerBase
 from utils.eval import summarize_seed_runs
 from utils.hypergraph import SimpleHypergraph
-from utils.metrics import hit_rate_at_k, ndcg_at_k
 from utils.minibatch_sampling import expand_hyperedge_centered_subhypergraph
 
 
@@ -19,18 +18,18 @@ class RecommendationTrainer(DownstreamTrainerBase):
         train_adj = graph.metadata["train_adj_list"]
         test_adj = graph.metadata["test_adj_list"]
         train_core: List[List[int]] = []
-        val_targets: List[int] = []
-        test_targets: List[int] = []
+        val_targets: List[List[int]] = []
+        test_targets: List[List[int]] = []
         for train_items, test_items in zip(train_adj, test_adj):
             unique_train = list(dict.fromkeys(int(item_id) for item_id in train_items))
             unique_test = list(dict.fromkeys(int(item_id) for item_id in test_items))
             if len(unique_train) > 1:
-                val_targets.append(int(unique_train[-1]))
+                val_targets.append([int(unique_train[-1])])
                 train_core.append(unique_train[:-1])
             else:
-                val_targets.append(-1)
+                val_targets.append([])
                 train_core.append(unique_train)
-            test_targets.append(int(unique_test[0]) if unique_test else -1)
+            test_targets.append(unique_test)
         metadata = dict(graph.metadata)
         metadata["train_core_adj_list"] = train_core
         metadata["val_targets"] = val_targets
@@ -103,13 +102,35 @@ class RecommendationTrainer(DownstreamTrainerBase):
         node_mapping = {global_id: local_id for local_id, global_id in enumerate(global_node_ids)}
         return subhypergraph, local_user_edge_id, node_mapping
 
-    def _ranking_metrics(self, ranked_items: Sequence[int], positive_item: int) -> Dict[str, float]:
+    def _ranking_metrics(self, ranked_items: Sequence[int], positive_items: Sequence[int]) -> Dict[str, float]:
+        positives = set(int(item_id) for item_id in positive_items)
+        if not positives:
+            return {"hr@5": 0.0, "hr@10": 0.0, "ndcg@5": 0.0, "ndcg@10": 0.0}
         return {
-            "hr@5": hit_rate_at_k(ranked_items, positive_item, 5),
-            "hr@10": hit_rate_at_k(ranked_items, positive_item, 10),
-            "ndcg@5": ndcg_at_k(ranked_items, positive_item, 5),
-            "ndcg@10": ndcg_at_k(ranked_items, positive_item, 10),
+            "hr@5": self._multi_positive_hit_rate(ranked_items, positives, 5),
+            "hr@10": self._multi_positive_hit_rate(ranked_items, positives, 10),
+            "ndcg@5": self._multi_positive_ndcg(ranked_items, positives, 5),
+            "ndcg@10": self._multi_positive_ndcg(ranked_items, positives, 10),
         }
+
+    def _multi_positive_hit_rate(self, ranked_items: Sequence[int], positive_items: set[int], k: int) -> float:
+        if k <= 0:
+            return 0.0
+        return float(any(item_id in positive_items for item_id in list(ranked_items)[:k]))
+
+    def _multi_positive_ndcg(self, ranked_items: Sequence[int], positive_items: set[int], k: int) -> float:
+        if k <= 0 or not positive_items:
+            return 0.0
+        top_k = list(ranked_items)[:k]
+        dcg = 0.0
+        for rank, item_id in enumerate(top_k, start=1):
+            if item_id in positive_items:
+                dcg += 1.0 / torch.log2(torch.tensor(float(rank + 1))).item()
+        ideal_hits = min(len(positive_items), k)
+        idcg = 0.0
+        for rank in range(1, ideal_hits + 1):
+            idcg += 1.0 / torch.log2(torch.tensor(float(rank + 1))).item()
+        return float(dcg / idcg) if idcg > 0 else 0.0
 
     def _evaluate_split(
         self,
@@ -121,6 +142,9 @@ class RecommendationTrainer(DownstreamTrainerBase):
     ) -> Dict[str, float]:
         all_metrics: List[Dict[str, float]] = []
         eval_negative_samples = int(self.config["training"].get("eval_negative_samples", 99))
+        max_eval_users = int(self.config["training"].get("max_eval_users", 0))
+        if max_eval_users > 0:
+            eval_users = list(eval_users)[:max_eval_users]
         train_core = graph.metadata["train_core_adj_list"]
         raw_train = graph.metadata["train_adj_list"]
         raw_test = graph.metadata["test_targets"]
@@ -128,18 +152,16 @@ class RecommendationTrainer(DownstreamTrainerBase):
         encoder.eval()
         with torch.no_grad():
             for offset, user_id in enumerate(eval_users):
-                positive_item = int(targets[user_id])
-                if positive_item < 0:
+                positive_items = [int(item_id) for item_id in targets[user_id] if int(item_id) >= 0]
+                if not positive_items:
                     continue
                 excluded = set(int(item_id) for item_id in raw_train[user_id])
-                test_item = int(raw_test[user_id])
-                if test_item >= 0:
-                    excluded.add(test_item)
+                excluded.update(int(item_id) for item_id in raw_test[user_id] if int(item_id) >= 0)
                 negative_items = []
                 for negative_index in range(eval_negative_samples):
                     negative_items.append(
                         self._sample_negative_item(
-                            excluded=set(excluded).union(negative_items).union({positive_item}),
+                            excluded=set(excluded).union(negative_items).union(positive_items),
                             num_items=int(graph.metadata["num_items"]),
                             seed=seed + user_id * 1009 + negative_index,
                         )
@@ -147,7 +169,7 @@ class RecommendationTrainer(DownstreamTrainerBase):
                 subhypergraph, local_user_edge_id, node_mapping = self._build_user_subhypergraph(
                     graph,
                     user_id=user_id,
-                    candidate_item_ids=[positive_item] + negative_items,
+                    candidate_item_ids=list(dict.fromkeys(positive_items + negative_items)),
                     seed=seed + offset * 37,
                 )
                 node_emb, edge_emb, _, _ = encoder(
@@ -159,13 +181,13 @@ class RecommendationTrainer(DownstreamTrainerBase):
                     motif_seed=0,
                 )
                 user_emb = edge_emb[local_user_edge_id]
-                candidate_ids = [positive_item] + negative_items
+                candidate_ids = list(dict.fromkeys(positive_items + negative_items))
                 candidate_scores = []
                 for item_id in candidate_ids:
                     item_emb = node_emb[node_mapping[item_id]]
                     candidate_scores.append(float(torch.dot(user_emb, item_emb).item()))
                 ranking = [item_id for _, item_id in sorted(zip(candidate_scores, candidate_ids), key=lambda pair: pair[0], reverse=True)]
-                all_metrics.append(self._ranking_metrics(ranking, positive_item))
+                all_metrics.append(self._ranking_metrics(ranking, positive_items))
         eval_time = time.perf_counter() - eval_start
         if not all_metrics:
             return {
@@ -192,7 +214,7 @@ class RecommendationTrainer(DownstreamTrainerBase):
         train_core = graph.metadata["train_core_adj_list"]
         val_targets = graph.metadata["val_targets"]
         train_users = [user_id for user_id, items in enumerate(train_core) if items]
-        val_users = [user_id for user_id, item_id in enumerate(val_targets) if item_id >= 0 and train_core[user_id]]
+        val_users = [user_id for user_id, item_ids in enumerate(val_targets) if item_ids and train_core[user_id]]
         if not train_users:
             raise ValueError(f"Recommendation dataset '{graph.dataset_name}' has no trainable users.")
         users_per_epoch = min(int(self.config["training"].get("users_per_epoch", 256)), len(train_users))
@@ -273,7 +295,7 @@ class RecommendationTrainer(DownstreamTrainerBase):
         train_time_sec = time.perf_counter() - train_start
         if best_encoder_state is not None:
             encoder.load_state_dict(best_encoder_state, strict=False)
-        test_users = [user_id for user_id, item_id in enumerate(graph.metadata["test_targets"]) if item_id >= 0 and train_core[user_id]]
+        test_users = [user_id for user_id, item_ids in enumerate(graph.metadata["test_targets"]) if item_ids and train_core[user_id]]
         test_metrics = self._evaluate_split(
             encoder,
             graph,
@@ -325,4 +347,3 @@ class RecommendationTrainer(DownstreamTrainerBase):
         for metric_name in metric_names:
             summary.update(summarize_seed_runs(aggregate[metric_name], metric_name=metric_name))
         return self.attach_pretrain_domains(summary)
-

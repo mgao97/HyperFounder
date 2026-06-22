@@ -22,7 +22,7 @@ class FinetuneTrainer(DownstreamTrainerBase):
         num_classes = int(graph.metadata["num_node_classes"])
         classifier = torch.nn.Linear(int(self.config["model"]["hidden_dim"]), num_classes).to(self.device)
         params = list(encoder.parameters()) + list(classifier.parameters())
-        optimizer = torch.optim.Adam(
+        optimizer = torch.optim.AdamW(
             params,
             lr=float(self.config["training"]["lr"]),
             weight_decay=float(self.config["training"].get("weight_decay", 0.0)),

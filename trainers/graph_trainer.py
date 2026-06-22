@@ -21,9 +21,23 @@ class GraphFinetuneTrainer(DownstreamTrainerBase):
             if not (has_graph_label and has_graph_split):
                 incompatible.append(graph.dataset_name)
         if incompatible:
-            raise ValueError(
-                "The current DHG environment does not expose compatible graph-level datasets with per-graph labels and "
-                f"train/val/test splits. Incompatible datasets: {', '.join(incompatible)}"
-            )
-        raise NotImplementedError("Graph-level fine-tuning is reserved for DHG datasets that satisfy the graph contract.")
-
+            summary: Dict[str, float | str] = {
+                "task": "graph",
+                "heldout_domain": resolved_domain,
+                "supported": False,
+                "evaluated_datasets": [],
+                "configured_datasets": dataset_names,
+                "incompatible_datasets": incompatible,
+                "reason": "The current DHG environment does not expose graph-level datasets with per-graph labels and train/val/test splits.",
+            }
+            return self.attach_pretrain_domains(summary)
+        return self.attach_pretrain_domains(
+            {
+                "task": "graph",
+                "heldout_domain": resolved_domain,
+                "supported": False,
+                "evaluated_datasets": [],
+                "configured_datasets": dataset_names,
+                "reason": "Graph-level fine-tuning is not implemented because no compatible DHG graph dataset has been wired yet.",
+            }
+        )
