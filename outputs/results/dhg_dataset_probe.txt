@@ -1,0 +1,78 @@
+================================================================================
+DATASET Gowalla
+KEYS ['num_interactions', 'num_items', 'num_users', 'test_adj_list', 'train_adj_list']
+  num_interactions -> int
+  num_items -> int
+  num_users -> int
+  test_adj_list -> list(len=29858, elem_type=list)
+  train_adj_list -> list(len=29858, elem_type=list)
+================================================================================
+DATASET Yelp3k
+KEYS ['dim_features', 'edge_list', 'features', 'labels', 'num_classes', 'num_edges', 'num_vertices']
+  edge_list -> list(len=24137, elem_type=tuple)
+  features -> Tensor(shape=(3855, 1862))
+  labels -> Tensor(shape=(3855,))
+  num_classes -> int
+  num_edges -> int
+  num_vertices -> int
+================================================================================
+DATASET Yelp2018
+KEYS ['num_interactions', 'num_items', 'num_users', 'test_adj_list', 'train_adj_list']
+  num_interactions -> int
+  num_items -> int
+  num_users -> int
+  test_adj_list -> list(len=31668, elem_type=list)
+  train_adj_list -> list(len=31668, elem_type=list)
+================================================================================
+DATASET News20
+KEYS ['dim_features', 'edge_list', 'features', 'labels', 'num_classes', 'num_edges', 'num_vertices']
+  edge_list -> list(len=100, elem_type=list)
+  features -> Tensor(shape=(16342, 100))
+  labels -> Tensor(shape=(16342,))
+  num_classes -> int
+  num_edges -> int
+  num_vertices -> int
+================================================================================
+DATASET Cooking200
+KEYS ['edge_list', 'labels', 'num_classes', 'num_edges', 'num_vertices', 'test_mask', 'train_mask', 'val_mask']
+  edge_list -> list(len=2755, elem_type=list)
+  labels -> Tensor(shape=(7403,))
+  num_classes -> int
+  num_edges -> int
+  num_vertices -> int
+  test_mask -> Tensor(shape=(7403,))
+  train_mask -> Tensor(shape=(7403,))
+  val_mask -> Tensor(shape=(7403,))
+================================================================================
+DATASET MovieLens1M
+KEYS ['num_interactions', 'num_items', 'num_users', 'test_adj_list', 'train_adj_list']
+  num_interactions -> int
+  num_items -> int
+  num_users -> int
+  test_adj_list -> list(len=6022, elem_type=list)
+  train_adj_list -> list(len=6022, elem_type=list)
+================================================================================
+DATASET IMDB4k
+KEYS ['dim_features', 'edge_by_actor', 'edge_by_director', 'features', 'labels', 'num_actor_edges', 'num_classes', 'num_director_edges', 'num_vertices']
+  features -> Tensor(shape=(4278, 3066))
+  labels -> Tensor(shape=(4278,))
+  num_classes -> int
+  num_vertices -> int
+================================================================================
+DATASET DBLP8k
+KEYS ['edge_list', 'num_edges', 'num_vertices']
+  edge_list -> list(len=2603, elem_type=list)
+  num_edges -> int
+  num_vertices -> int
+================================================================================
+DATASET CocitationCora
+KEYS ['dim_features', 'edge_list', 'features', 'labels', 'num_classes', 'num_edges', 'num_vertices', 'test_mask', 'train_mask', 'val_mask']
+  edge_list -> list(len=1579, elem_type=set)
+  features -> Tensor(shape=(2708, 1433))
+  labels -> Tensor(shape=(2708,))
+  num_classes -> int
+  num_edges -> int
+  num_vertices -> int
+  test_mask -> Tensor(shape=(2708,))
+  train_mask -> Tensor(shape=(2708,))
+  val_mask -> Tensor(shape=(2708,))

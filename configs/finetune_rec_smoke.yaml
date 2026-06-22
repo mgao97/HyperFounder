@@ -1,0 +1,35 @@
+model:
+  input_dim: 128
+  hidden_dim: 128
+  dropout: 0.3
+  num_layers: 2
+  num_heads: 4
+  spectral_dim: 4
+
+training:
+  seed: 7
+  device: cpu
+  lr: 0.001
+  weight_decay: 0.0005
+  finetune_epochs: 2
+  num_seeds: 1
+  users_per_epoch: 8
+  negatives_per_positive: 1
+  eval_negative_samples: 9
+  early_stopping:
+    patience: 2
+  minibatch:
+    max_nodes: 96
+    max_edges: 24
+    expansion_hops: 1
+  output_dir: outputs
+  pretrained_checkpoint: outputs/checkpoints/pretrain_last.pt
+  task_name: rec
+
+data:
+  datasets:
+    - movielens_1m
+  domain_map:
+    movielens_1m: recommendation
+  cache_dir: data/cache
+

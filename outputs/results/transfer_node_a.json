@@ -1,0 +1,18 @@
+{
+  "node_accuracy": 0.10695742815732956,
+  "node_accuracy_std": 0.0,
+  "heldout_domain": "authorship",
+  "task": "node",
+  "num_graphs": 1,
+  "evaluated_datasets": [
+    "coauthorship_cora"
+  ],
+  "pretrain_domains": [
+    "authorship",
+    "citation",
+    "commerce",
+    "education",
+    "political",
+    "review"
+  ]
+}

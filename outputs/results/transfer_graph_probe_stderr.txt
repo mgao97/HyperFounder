@@ -1,0 +1,8 @@
+Traceback (most recent call last):
+  File "scripts/run_transfer.py", line 43, in <module>
+    main()
+  File "scripts/run_transfer.py", line 37, in main
+    summary = trainer.run(task_name=task_name, heldout_domain=args.heldout_domain)
+  File "/Users/santa/Desktop/HyperFounder/trainers/graph_trainer.py", line 24, in run
+    raise ValueError(
+ValueError: The current DHG environment does not expose compatible graph-level datasets with per-graph labels and train/val/test splits. Incompatible datasets: house_committees

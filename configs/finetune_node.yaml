@@ -1,0 +1,42 @@
+model:
+  input_dim: 128
+  hidden_dim: 128
+  dropout: 0.3
+  num_layers: 4
+  num_heads: 8
+  spectral_dim: 8
+
+training:
+  seed: 7
+  device: cpu
+  lr: 0.001
+  weight_decay: 0.0005
+  finetune_epochs: 1000
+  num_seeds: 3
+  early_stopping:
+    patience: 50
+  output_dir: outputs
+  pretrained_checkpoint: outputs/checkpoints/pretrain_last.pt
+  task_name: node
+
+data:
+  datasets:
+    - cora_cc
+    - citeseer_cc
+    - pubmed_cc
+    - coauthorship_cora
+    - coauthorship_dblp
+    - cooking_200
+    - tencent_2k
+  domain_map:
+    cora_cc: citation
+    citeseer_cc: citation
+    pubmed_cc: citation
+    coauthorship_cora: academic
+    coauthorship_dblp: academic
+    cooking_200: document
+    tencent_2k: recommendation
+  cache_dir: data/cache
+  splits:
+    train_ratio: 0.6
+    val_ratio: 0.2

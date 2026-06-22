@@ -1,0 +1,39 @@
+model:
+  input_dim: 128
+  hidden_dim: 128
+  dropout: 0.3
+  num_layers: 4
+  num_heads: 8
+  spectral_dim: 8
+
+training:
+  seed: 7
+  device: cpu
+  lr: 0.001
+  weight_decay: 0.0005
+  finetune_epochs: 300
+  num_seeds: 3
+  users_per_epoch: 256
+  negatives_per_positive: 1
+  eval_negative_samples: 99
+  early_stopping:
+    patience: 50
+  minibatch:
+    max_nodes: 256
+    max_edges: 64
+    expansion_hops: 2
+  output_dir: outputs
+  pretrained_checkpoint: outputs/checkpoints/pretrain_last.pt
+  task_name: rec
+
+data:
+  datasets:
+    - movielens_1m
+    - gowalla
+    - yelp_2018
+  domain_map:
+    movielens_1m: recommendation
+    gowalla: recommendation
+    yelp_2018: recommendation
+  cache_dir: data/cache
+

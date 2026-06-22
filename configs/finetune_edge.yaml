@@ -1,0 +1,31 @@
+model:
+  input_dim: 128
+  hidden_dim: 64
+  dropout: 0.3
+  num_layers: 2
+  num_heads: 4
+  spectral_dim: 4
+
+training:
+  seed: 7
+  device: cpu
+  lr: 0.001
+  finetune_epochs: 4
+  output_dir: outputs
+  pretrained_checkpoint: outputs/checkpoints/pretrain_last.pt
+  task_name: edge
+
+data:
+  datasets:
+    - cocitation_cora
+    - senate_committees
+    - house_committees
+  domain_map:
+    cocitation_cora: citation
+    senate_committees: political
+    house_committees: political
+  feature_strategy: dataset
+  cache_dir: data/cache
+  splits:
+    train_ratio: 0.6
+    val_ratio: 0.2

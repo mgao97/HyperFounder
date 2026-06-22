@@ -1,0 +1,7 @@
+{
+  "node_accuracy": 0.17990654706954956,
+  "node_accuracy_std": 0.0,
+  "heldout_domain": "citation",
+  "task": "node",
+  "num_graphs": 1
+}

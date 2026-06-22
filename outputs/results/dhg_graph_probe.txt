@@ -1,0 +1,3 @@
+Cooking200 ['edge_list', 'labels', 'num_classes', 'num_edges', 'num_vertices', 'test_mask', 'train_mask', 'val_mask']
+HouseCommittees ['edge_list', 'labels', 'num_classes', 'num_edges', 'num_vertices']
+WalmartTrips ['edge_list', 'labels', 'num_classes', 'num_edges', 'num_vertices']

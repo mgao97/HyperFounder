@@ -1,0 +1,28 @@
+model:
+  input_dim: 128
+  hidden_dim: 128
+  dropout: 0.3
+  num_layers: 2
+  num_heads: 4
+  spectral_dim: 4
+
+training:
+  seed: 7
+  device: cpu
+  lr: 0.001
+  weight_decay: 0.0005
+  finetune_epochs: 10
+  num_seeds: 1
+  early_stopping:
+    patience: 3
+  output_dir: outputs
+  pretrained_checkpoint: outputs/checkpoints/pretrain_last.pt
+  task_name: node
+
+data:
+  datasets:
+    - cora_cc
+  domain_map:
+    cora_cc: citation
+  cache_dir: data/cache
+

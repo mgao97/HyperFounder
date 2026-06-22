@@ -1,0 +1,69 @@
+model:
+  input_dim: 128
+  hidden_dim: 128
+  dropout: 0.3
+  num_layers: 4
+  num_heads: 8
+  spectral_dim: 8
+
+tasks:
+  node_clusters: 4
+  motif_clusters: 4
+  community_clusters: 4
+  prototype_clusters: 4
+
+training:
+  seed: 7
+  device: cpu
+  epochs: 300
+  steps_per_epoch: 32
+  lr: 0.001
+  weight_decay: 0.0001
+  motif_budget: 32
+  feature_mask_rate: 0.15
+  edge_dropout_rate: 0.2
+  output_dir: outputs
+  early_stopping:
+    patience: 50
+  minibatch:
+    domains_per_step: 2
+    subhypergraphs_per_domain: 2
+    max_nodes: 256
+    max_edges: 128
+    expansion_hops: 2
+    seed_edges_per_subhypergraph: 1
+    use_subhypergraph_pool: true
+    subhypergraph_pool_size: 512
+    large_graph_node_threshold: 5000
+  loss_weights:
+    struct: 1.0
+    node: 1.0
+    edge: 1.0
+    motif: 1.0
+    community: 0.5
+    global: 0.5
+    cross: 1.0
+
+data:
+  datasets:
+    - cora_cc
+    - citeseer_cc
+    - pubmed_cc
+    - coauthorship_dblp
+    - imdb_4k
+    - cooking_200
+    - gowalla
+    - yelp_2018
+  domain_map:
+    cora_cc: citation
+    citeseer_cc: citation
+    pubmed_cc: citation
+    coauthorship_dblp: academic
+    imdb_4k: academic
+    cooking_200: document
+    gowalla: recommendation
+    yelp_2018: recommendation
+  cache_dir: data/cache
+  splits:
+    train_ratio: 0.6
+    val_ratio: 0.2

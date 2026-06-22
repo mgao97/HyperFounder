@@ -1,0 +1,30 @@
+model:
+  input_dim: 128
+  hidden_dim: 128
+  dropout: 0.3
+  num_layers: 4
+  num_heads: 8
+  spectral_dim: 8
+
+training:
+  seed: 7
+  device: cpu
+  lr: 0.001
+  weight_decay: 0.0005
+  finetune_epochs: 300
+  num_seeds: 3
+  early_stopping:
+    patience: 50
+  output_dir: outputs
+  pretrained_checkpoint: outputs/checkpoints/pretrain_last.pt
+  task_name: graph
+
+data:
+  datasets:
+    - house_committees
+    - walmart_trips
+  domain_map:
+    house_committees: political
+    walmart_trips: commerce
+  cache_dir: data/cache
+

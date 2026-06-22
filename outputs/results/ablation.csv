@@ -1,0 +1,2 @@
+checkpoint_path,loss_history_path,task
+outputs/checkpoints/pretrain_last.pt,outputs/logs/pretrain_losses.csv,community

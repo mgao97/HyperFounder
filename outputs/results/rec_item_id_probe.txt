@@ -1,0 +1,3 @@
+MovieLens1M num_items 3043 min 0 max 3042
+Gowalla num_items 40981 min 0 max 40974
+Yelp2018 num_items 38048 min 0 max 38016
