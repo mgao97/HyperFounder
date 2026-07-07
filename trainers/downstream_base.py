@@ -6,28 +6,28 @@ from typing import Dict, List
 import torch
 
 from models.encoder import UnifiedHypergraphEncoder
-from utils.common import ensure_dir
 from utils.dataset_registry import get_dataset_spec
 from utils.dhg_datasets import load_domain_graphs
 from utils.hypergraph import build_domain_aliases, iter_graphs
+from trainers.trainer_base import TrainerBase
 
 
-class DownstreamTrainerBase:
+class DownstreamTrainerBase(TrainerBase):
     def __init__(self, config: Dict):
-        self.config = config
-        self.device = torch.device(config["training"].get("device", "cpu"))
-        self.output_dir = Path(config["training"]["output_dir"])
-        ensure_dir(self.output_dir / "results")
+        super().__init__(config, ensure_subdirs=("results",))
         self.pretrain_config: Dict | None = None
 
     def build_encoder(self) -> UnifiedHypergraphEncoder:
+        domain_names = sorted(set(self.config.get("data", {}).get("domain_map", {}).values()))
         encoder = UnifiedHypergraphEncoder(
             in_dim=int(self.config["model"]["input_dim"]),
             hidden_dim=int(self.config["model"]["hidden_dim"]),
             dropout=float(self.config["model"]["dropout"]),
             num_layers=int(self.config["model"]["num_layers"]),
             num_heads=int(self.config["model"]["num_heads"]),
-            spectral_dim=int(self.config["model"]["spectral_dim"]),
+            structure_pe_dim=int(self.config["model"].get("structure_pe_dim", self.config["model"].get("spectral_dim", 0))),
+            num_domains=len(domain_names) if domain_names else 1,
+            domain_names=domain_names,
         ).to(self.device)
         checkpoint_path = self.config["training"].get("pretrained_checkpoint")
         if checkpoint_path and Path(checkpoint_path).exists():
@@ -82,4 +82,3 @@ class DownstreamTrainerBase:
             pretrain_domain_map = self.pretrain_config.get("data", {}).get("domain_map", {})
             summary["pretrain_domains"] = sorted(set(pretrain_domain_map.values()))
         return summary
-

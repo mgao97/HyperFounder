@@ -1,11 +1,18 @@
 from __future__ import annotations
 
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Sequence
 
 import torch
 from torch import nn
 
-from models.backbone import build_backbone
+from models.cross_domain_modules import (
+    CrossDomainFeatureProjectionModule,
+    CrossDomainStructuralPEModule,
+    EncoderLayer,
+    EncoderLayerConfig,
+    HierarchicalHypergraphPooling,
+)
+from models.hypergraph_data import HypergraphData
 from utils.hypergraph import SimpleHypergraph
 from utils.sampling import build_community_embeddings, build_cross_scale_embeddings, build_motif_embeddings, sample_communities, sample_motifs
 
@@ -18,19 +25,44 @@ class UnifiedHypergraphEncoder(nn.Module):
         dropout: float,
         num_layers: int,
         num_heads: int,
-        spectral_dim: int,
+        structure_pe_dim: int,
+        num_domains: int = 4,
+        domain_names: Optional[Sequence[str]] = None,
+        topk: int = 16,
+        pooled_nodes: int = 64,
+        pooled_edges: int = 32,
     ):
         super().__init__()
-        self.backbone = build_backbone(
-            in_dim=in_dim,
+        pe_dim = max(int(structure_pe_dim), 1)
+        self.pe_module = CrossDomainStructuralPEModule(d_pe=pe_dim)
+        self.projector = CrossDomainFeatureProjectionModule(hidden_dim=hidden_dim)
+        self.node_pe_align = nn.Identity() if pe_dim == hidden_dim else nn.Linear(pe_dim, hidden_dim)
+        self.edge_pe_align = nn.Identity() if pe_dim == hidden_dim else nn.Linear(pe_dim, hidden_dim)
+        self.encoder_layers = nn.ModuleList(
+            [
+                EncoderLayer(
+                    EncoderLayerConfig(
+                        hidden_dim=hidden_dim,
+                        num_heads=num_heads,
+                        topk=topk,
+                        dropout=dropout,
+                    )
+                )
+                for _ in range(num_layers)
+            ]
+        )
+        self.pooling_module = HierarchicalHypergraphPooling(
             hidden_dim=hidden_dim,
-            dropout=dropout,
-            num_layers=num_layers,
-            num_heads=num_heads,
-            spectral_dim=spectral_dim,
+            pooled_nodes=pooled_nodes,
+            pooled_edges=pooled_edges,
         )
         self.readout_projection = nn.Linear(hidden_dim * 2, hidden_dim)
         self.subhypergraph_projection = nn.Linear(hidden_dim * 2, hidden_dim)
+        if domain_names is None:
+            self.domain_to_id: Dict[str, int] = {}
+        else:
+            self.domain_to_id = {str(name): index for index, name in enumerate(domain_names)}
+        self.num_domains = int(num_domains)
 
     def encode_candidate_hyperedges(self, node_emb: torch.Tensor, hyperedges: List[List[int]]) -> torch.Tensor:
         if not hyperedges:
@@ -45,35 +77,122 @@ class UnifiedHypergraphEncoder(nn.Module):
 
     def forward(
         self,
-        hg: SimpleHypergraph,
-        x: torch.Tensor,
+        hg: SimpleHypergraph | HypergraphData,
+        x: Optional[torch.Tensor] = None,
         motif_budget: int = 32,
         motifs: Optional[List[Dict[str, List[int]]]] = None,
         communities: Optional[List[Dict[str, List[int]]]] = None,
         motif_seed: int = 0,
     ):
-        incidence = hg.incidence_matrix().to(x.device)
-        node_emb, edge_emb, structure_cache = self.backbone(x, incidence)
-        node_emb = torch.nan_to_num(node_emb, nan=0.0, posinf=0.0, neginf=0.0)
-        edge_emb = torch.nan_to_num(edge_emb, nan=0.0, posinf=0.0, neginf=0.0)
-        node_graph = node_emb.mean(dim=0) if node_emb.numel() else x.new_zeros((self.readout_projection.out_features,))
-        edge_graph = edge_emb.mean(dim=0) if edge_emb.numel() else node_graph.new_zeros(node_graph.shape)
-        graph_emb = torch.nan_to_num(self.readout_projection(torch.cat([node_graph, edge_graph], dim=0)), nan=0.0, posinf=0.0, neginf=0.0)
-        motif_items = motifs if motifs is not None else sample_motifs(hg, budget=motif_budget, seed=motif_seed)
-        community_items = communities if communities is not None else sample_communities(hg)
-        motif_emb = torch.nan_to_num(build_motif_embeddings(node_emb, edge_emb, motif_items, self.subhypergraph_projection), nan=0.0, posinf=0.0, neginf=0.0)
-        community_emb = torch.nan_to_num(build_community_embeddings(node_emb, edge_emb, community_items, self.subhypergraph_projection), nan=0.0, posinf=0.0, neginf=0.0)
-        cross_emb = torch.nan_to_num(build_cross_scale_embeddings(motif_emb, community_emb, graph_emb), nan=0.0, posinf=0.0, neginf=0.0)
+        if isinstance(hg, HypergraphData):
+            data = hg
+            feature_tensor = hg.node_features
+            incidence_dense = hg.incidence_matrix.to_dense() if hg.incidence_matrix.is_sparse else hg.incidence_matrix
+            domain_name = str(hg.domain_id)
+            domain_id = int(hg.domain_id)
+            edge_features = hg.edge_features
+            source_hg = None
+        else:
+            if x is None:
+                raise ValueError("Encoder forward requires `x` when input is SimpleHypergraph.")
+            incidence_dense = hg.incidence_matrix().to(x.device)
+            incidence = incidence_dense.to_sparse_coo()
+            num_edges = incidence_dense.size(1)
+            edge_features = x.new_zeros((num_edges, x.size(-1)))
+            if self.domain_to_id:
+                domain_id = int(self.domain_to_id.get(hg.domain, 0))
+            else:
+                domain_id = int(abs(hash(hg.domain)) % max(self.num_domains, 1))
+            data = HypergraphData(
+                node_features=x,
+                edge_features=edge_features,
+                incidence_matrix=incidence,
+                node_labels=hg.node_labels.to(x.device) if hg.node_labels is not None else None,
+                domain_id=domain_id,
+                feature_type=str(getattr(hg, "feature_type", "numerical")),
+            )
+            feature_tensor = x
+            domain_name = hg.domain
+            source_hg = hg
+        model_device = next(self.parameters()).device
+        if data.node_features.device != model_device:
+            data.node_features = data.node_features.to(model_device)
+        if data.edge_features.device != model_device:
+            data.edge_features = data.edge_features.to(model_device)
+        if data.incidence_matrix.device != model_device:
+            data.incidence_matrix = data.incidence_matrix.to(model_device)
+        if incidence_dense.device != model_device:
+            incidence_dense = incidence_dense.to(model_device)
+        if data.node_labels is not None and data.node_labels.device != model_device:
+            data.node_labels = data.node_labels.to(model_device)
+        self.projector.register_domain(
+            domain_id=data.domain_id,
+            node_dim=int(data.node_features.size(-1)),
+            edge_dim=int(edge_features.size(-1)),
+            feature_type=str(data.feature_type),
+        )
+        incidence = data.incidence_matrix if data.incidence_matrix.is_sparse else data.incidence_matrix.to_sparse_coo()
+        pe_node, pe_edge = self.pe_module(incidence)
+        pe_node = self.node_pe_align(pe_node)
+        pe_edge = self.edge_pe_align(pe_edge)
+        node_tokens = self.projector(data.node_features, domain_id=data.domain_id, is_edge=False) + pe_node
+        edge_tokens = self.projector(data.edge_features, domain_id=data.domain_id, is_edge=True) + pe_edge
+
+        sparse_attn_index = []
+        for layer in self.encoder_layers:
+            node_tokens, edge_tokens, layer_topk = layer(node_tokens, edge_tokens, incidence)
+            sparse_attn_index.append(layer_topk)
+
+        node_emb = torch.nan_to_num(node_tokens, nan=0.0, posinf=0.0, neginf=0.0)
+        edge_emb = torch.nan_to_num(edge_tokens, nan=0.0, posinf=0.0, neginf=0.0)
+
+        pooled_nodes, pooled_edges, pooled_incidence = self.pooling_module(node_emb, edge_emb, incidence)
+        node_graph = pooled_nodes.mean(dim=0) if pooled_nodes.numel() else node_emb.mean(dim=0)
+        edge_graph = pooled_edges.mean(dim=0) if pooled_edges.numel() else edge_emb.mean(dim=0)
+        graph_emb = torch.nan_to_num(
+            self.readout_projection(torch.cat([node_graph, edge_graph], dim=0)),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+
+        motif_items = motifs if motifs is not None else (
+            sample_motifs(source_hg, budget=motif_budget, seed=motif_seed) if source_hg is not None else []
+        )
+        community_items = communities if communities is not None else (
+            sample_communities(source_hg) if source_hg is not None else []
+        )
+        motif_emb = torch.nan_to_num(
+            build_motif_embeddings(node_emb, edge_emb, motif_items, self.subhypergraph_projection),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+        community_emb = torch.nan_to_num(
+            build_community_embeddings(node_emb, edge_emb, community_items, self.subhypergraph_projection),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+        cross_emb = torch.nan_to_num(
+            build_cross_scale_embeddings(motif_emb, community_emb, graph_emb),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
         aux = {
             "motif_emb": motif_emb,
             "community_emb": community_emb,
             "cross_emb": cross_emb,
             "motifs": motif_items,
             "communities": community_items,
-            "incidence": incidence,
-            "node_bias": structure_cache["node_bias"],
-            "edge_bias": structure_cache["edge_bias"],
-            "node_pe": structure_cache["node_pe"],
-            "edge_pe": structure_cache["edge_pe"],
+            "incidence": incidence_dense,
+            "pooled_incidence": pooled_incidence,
+            "pooled_node_emb": pooled_nodes,
+            "pooled_edge_emb": pooled_edges,
+            "node_pe": pe_node,
+            "edge_pe": pe_edge,
+            "sparse_attn_index": sparse_attn_index[-1] if sparse_attn_index else feature_tensor.new_zeros((feature_tensor.size(0), 0), dtype=torch.long),
+            "domain_name": domain_name,
         }
         return node_emb, edge_emb, graph_emb, aux

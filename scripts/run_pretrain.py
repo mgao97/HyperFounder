@@ -15,12 +15,16 @@ from utils.common import load_yaml, save_json, set_seed
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run hypergraph pretraining.")
     parser.add_argument("--config", required=True, help="Path to the pretraining config.")
+    parser.add_argument("--device", default=None, help="Optional device override, e.g. cpu or cuda.")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
     config = load_yaml(args.config)
+    if args.device:
+        config.setdefault("training", {})
+        config["training"]["device"] = args.device
     set_seed(int(config["training"]["seed"]))
     trainer = PretrainTrainer(config)
     summary = trainer.train()

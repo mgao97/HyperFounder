@@ -8,31 +8,21 @@ import torch.nn.functional as F
 from models.encoder import UnifiedHypergraphEncoder
 from models.heads import TaskHeads
 from utils.hypergraph import SimpleHypergraph
-from utils.sampling import augment_hypergraph, sample_negative_hyperedges
+from utils.sampling import augment_hypergraph
 
 
 def _zero(reference: torch.Tensor) -> torch.Tensor:
     return reference.new_tensor(0.0)
 
 
-def _global_contrastive_loss(z1: torch.Tensor, z2: torch.Tensor) -> torch.Tensor:
-    return torch.nan_to_num(1.0 - F.cosine_similarity(z1.unsqueeze(0), z2.unsqueeze(0)).mean(), nan=0.0, posinf=0.0, neginf=0.0)
-
-
-def _structure_loss(
-    heads: TaskHeads,
-    node_emb: torch.Tensor,
-    edge_emb: torch.Tensor,
-    incidence: torch.Tensor,
-) -> torch.Tensor:
-    if incidence.numel() == 0 or edge_emb.numel() == 0:
-        return _zero(node_emb.mean(dim=0))
-    incident_pairs = torch.nonzero(incidence > 0, as_tuple=False)
-    if incident_pairs.numel() == 0:
-        return _zero(node_emb.mean(dim=0))
-    node_repr = heads.structure_projection(node_emb[incident_pairs[:, 0]])
-    edge_repr = edge_emb[incident_pairs[:, 1]]
-    return F.mse_loss(node_repr, edge_repr)
+def _cross_view_contrastive_loss(z1: torch.Tensor, z2: torch.Tensor, tau: float = 0.07) -> torch.Tensor:
+    if z1.numel() == 0 or z2.numel() == 0:
+        return _zero(z1 if z1.numel() else z2)
+    z1 = F.normalize(z1, dim=-1)
+    z2 = F.normalize(z2, dim=-1)
+    sim = z1 @ z2.transpose(0, 1) / tau
+    labels = torch.arange(z1.size(0), device=z1.device)
+    return 0.5 * (F.cross_entropy(sim, labels) + F.cross_entropy(sim.transpose(0, 1), labels))
 
 
 def compute_pretraining_losses(
@@ -51,84 +41,92 @@ def compute_pretraining_losses(
         hg,
         x,
         motif_budget=int(config["training"]["motif_budget"]),
-        motifs=task_cache["motifs"],
-        communities=task_cache["communities"],
+        motifs=[],
+        communities=[],
         motif_seed=epoch,
     )
     losses: Dict[str, torch.Tensor] = {}
     weight_map = config["training"]["loss_weights"]
-    losses["struct"] = _zero(graph_emb) if "struct" in disabled else _structure_loss(heads, node_emb, edge_emb, aux["incidence"])
-
-    if "node" in disabled:
-        losses["node"] = _zero(graph_emb)
+    masked_view = augment_hypergraph(
+        hg,
+        feature_mask_rate=float(config["training"].get("feature_mask_rate", 0.15)),
+        edge_dropout_rate=float(config["training"].get("edge_dropout_rate", 0.2)),
+        seed=epoch * 17 + 1,
+        strategy="feature_masking",
+    )
+    masked_node_emb, _, _, _ = encoder(
+        masked_view,
+        torch.nan_to_num(masked_view.x.to(device), nan=0.0, posinf=0.0, neginf=0.0),
+        motif_budget=0,
+        motifs=[],
+        communities=[],
+        motif_seed=epoch,
+    )
+    feature_mask = masked_view.metadata.get("feature_mask")
+    masked_nodes = feature_mask.any(dim=1).to(device) if feature_mask is not None else masked_view.metadata.get("masked_nodes", torch.zeros(hg.num_nodes, dtype=torch.bool)).to(device)
+    if "masked_node" in disabled or not bool(masked_nodes.any()):
+        losses["masked_node"] = _zero(graph_emb)
     else:
-        node_logits = heads.node_head(node_emb)
-        losses["node"] = torch.nan_to_num(F.cross_entropy(node_logits, task_cache["node_labels"].to(device)), nan=0.0, posinf=0.0, neginf=0.0)
+        pred = heads.masked_node_decoder(masked_node_emb[masked_nodes])
+        target = x[masked_nodes]
+        losses["masked_node"] = torch.nan_to_num(F.mse_loss(pred, target), nan=0.0, posinf=0.0, neginf=0.0)
 
-    if "edge" in disabled or edge_emb.numel() == 0:
-        losses["edge"] = _zero(graph_emb)
+    incidence = aux["incidence"].to(device)
+    if "hyperedge_recon" in disabled or edge_emb.numel() == 0 or incidence.numel() == 0:
+        losses["hyperedge_recon"] = _zero(graph_emb)
     else:
-        negative_edges = sample_negative_hyperedges(
-            hg,
-            num_samples=len(hg.hyperedges),
-            seed=epoch + len(hg.hyperedges),
+        logits = edge_emb @ node_emb.transpose(0, 1)
+        target = incidence.float().transpose(0, 1)
+        losses["hyperedge_recon"] = torch.nan_to_num(
+            F.binary_cross_entropy_with_logits(logits, target),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
         )
-        negative_emb = encoder.encode_candidate_hyperedges(node_emb, negative_edges)
-        positive_logits = heads.edge_head(edge_emb).squeeze(-1)
-        negative_logits = heads.edge_head(negative_emb).squeeze(-1)
-        logits = torch.cat([positive_logits, negative_logits], dim=0)
-        labels = torch.cat(
-            [
-                torch.ones_like(positive_logits),
-                torch.zeros_like(negative_logits),
-            ],
-            dim=0,
+
+    aug_view = augment_hypergraph(
+        hg,
+        feature_mask_rate=float(config["training"].get("feature_mask_rate", 0.15)),
+        edge_dropout_rate=float(config["training"].get("edge_dropout_rate", 0.2)),
+        seed=epoch * 17 + 2,
+        strategy=str(config["training"].get("contrastive_strategy", "node_dropping")),
+    )
+    contrastive_node_emb, _, _, _ = encoder(
+        aug_view,
+        torch.nan_to_num(aug_view.x.to(device), nan=0.0, posinf=0.0, neginf=0.0),
+        motif_budget=0,
+        motifs=[],
+        communities=[],
+        motif_seed=epoch,
+    )
+    if "contrastive" in disabled:
+        losses["contrastive"] = _zero(graph_emb)
+    else:
+        proj_1 = heads.node_projector(node_emb)
+        proj_2 = heads.node_projector(contrastive_node_emb)
+        losses["contrastive"] = torch.nan_to_num(_cross_view_contrastive_loss(proj_1, proj_2), nan=0.0, posinf=0.0, neginf=0.0)
+
+    if "size_pred" in disabled or edge_emb.numel() == 0:
+        losses["size_pred"] = _zero(graph_emb)
+    else:
+        edge_cardinality = incidence.sum(dim=0).float().clamp_min(1.0)
+        pred = heads.edge_size_regressor(edge_emb).squeeze(-1)
+        target = edge_cardinality.log()
+        losses["size_pred"] = torch.nan_to_num(F.mse_loss(pred, target), nan=0.0, posinf=0.0, neginf=0.0)
+
+    if "domain_align" not in disabled and float(weight_map.get("domain_align", 0.0)) > 0.0:
+        domain_labels = torch.full((node_emb.size(0),), int(hg.metadata.get("domain_id", 0)), device=device, dtype=torch.long)
+        losses["domain_align"] = torch.nan_to_num(
+            F.cross_entropy(heads.domain_classifier(node_emb), domain_labels),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
         )
-        losses["edge"] = torch.nan_to_num(F.binary_cross_entropy_with_logits(logits, labels), nan=0.0, posinf=0.0, neginf=0.0)
-
-    motif_emb = aux["motif_emb"]
-    if "motif" in disabled or motif_emb.numel() == 0:
-        losses["motif"] = _zero(graph_emb)
     else:
-        motif_logits = heads.motif_head(motif_emb)
-        losses["motif"] = torch.nan_to_num(F.cross_entropy(motif_logits, task_cache["motif_labels"].to(device)), nan=0.0, posinf=0.0, neginf=0.0)
-
-    if "community" in disabled:
-        losses["community"] = _zero(graph_emb)
-    else:
-        community_logits = heads.community_head(node_emb)
-        losses["community"] = torch.nan_to_num(F.cross_entropy(community_logits, task_cache["community_node_labels"].to(device)), nan=0.0, posinf=0.0, neginf=0.0)
-
-    if "global" in disabled:
-        losses["global"] = _zero(graph_emb)
-    else:
-        aug_1 = augment_hypergraph(
-            hg,
-            feature_mask_rate=float(config["training"]["feature_mask_rate"]),
-            edge_dropout_rate=float(config["training"]["edge_dropout_rate"]),
-            seed=epoch * 7 + 1,
-        )
-        aug_2 = augment_hypergraph(
-            hg,
-            feature_mask_rate=float(config["training"]["feature_mask_rate"]),
-            edge_dropout_rate=float(config["training"]["edge_dropout_rate"]),
-            seed=epoch * 7 + 2,
-        )
-        _, _, graph_emb_1, _ = encoder(aug_1, aug_1.x.to(device), motif_budget=0, motifs=[], motif_seed=epoch)
-        _, _, graph_emb_2, _ = encoder(aug_2, aug_2.x.to(device), motif_budget=0, motifs=[], motif_seed=epoch)
-        proj_1 = heads.graph_projector(graph_emb_1)
-        proj_2 = heads.graph_projector(graph_emb_2)
-        losses["global"] = _global_contrastive_loss(proj_1, proj_2)
-
-    cross_emb = aux["cross_emb"]
-    if "cross" in disabled or cross_emb.numel() == 0 or task_cache["prototype_labels"].numel() == 0:
-        losses["cross"] = _zero(graph_emb)
-    else:
-        prototype_logits = heads.prototype_head(cross_emb)
-        losses["cross"] = torch.nan_to_num(F.cross_entropy(prototype_logits, task_cache["prototype_labels"].to(device)), nan=0.0, posinf=0.0, neginf=0.0)
+        losses["domain_align"] = _zero(graph_emb)
 
     total = _zero(graph_emb)
-    for task_name in ("struct", "node", "edge", "motif", "community", "global", "cross"):
+    for task_name in ("masked_node", "hyperedge_recon", "contrastive", "size_pred", "domain_align"):
         total = total + losses[task_name] * float(weight_map.get(task_name, 1.0))
     losses["total"] = torch.nan_to_num(total, nan=0.0, posinf=0.0, neginf=0.0)
     return losses

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import random
 from typing import Dict, List, Sequence
 
 import torch
@@ -164,15 +165,51 @@ def build_cross_scale_embeddings(motif_emb: torch.Tensor, community_emb: torch.T
     return torch.cat(pieces, dim=0)
 
 
-def augment_hypergraph(hg: SimpleHypergraph, feature_mask_rate: float, edge_dropout_rate: float, seed: int) -> SimpleHypergraph:
+def augment_hypergraph(
+    hg: SimpleHypergraph,
+    feature_mask_rate: float = 0.15,
+    edge_dropout_rate: float = 0.2,
+    seed: int = 0,
+    strategy: str = "random",
+) -> SimpleHypergraph:
     generator = torch.Generator().manual_seed(seed)
-    edge_keep_mask = torch.rand(len(hg.hyperedges), generator=generator) > edge_dropout_rate
-    kept_edges = [edge for keep, edge in zip(edge_keep_mask.tolist(), hg.hyperedges) if keep]
-    if not kept_edges:
-        kept_edges = hg.hyperedges[:1]
+    rng = random.Random(seed)
+    kept_edges = [list(edge) for edge in hg.hyperedges]
     masked_x = hg.x.clone()
-    feature_mask = torch.rand(masked_x.shape, generator=generator) < feature_mask_rate
-    masked_x[feature_mask] = 0.0
+    metadata = dict(hg.metadata)
+    node_mask = torch.zeros(hg.num_nodes, dtype=torch.bool)
+    if strategy in {"random", "node_dropping"}:
+        drop_count = int(0.15 * hg.num_nodes)
+        if drop_count > 0:
+            drop_idx = torch.randperm(hg.num_nodes, generator=generator)[:drop_count]
+            if strategy == "node_dropping":
+                kept_edges = [
+                    [node for node in edge if node not in set(int(idx) for idx in drop_idx.tolist())]
+                    for edge in kept_edges
+                ]
+            else:
+                masked_x[drop_idx] = 0.0
+            node_mask[drop_idx] = True
+    if strategy in {"random", "edge_masking"}:
+        edge_keep_mask = torch.rand(len(kept_edges), generator=generator) > edge_dropout_rate
+        kept_edges = [edge for keep, edge in zip(edge_keep_mask.tolist(), kept_edges) if keep]
+    if strategy in {"random", "feature_masking"}:
+        feature_mask = torch.rand(masked_x.shape, generator=generator) < feature_mask_rate
+        masked_x[feature_mask] = 0.0
+        metadata["feature_mask"] = feature_mask
+    if strategy == "hyperedge_perturb":
+        perturbed = []
+        for edge in kept_edges:
+            edge_set = set(edge)
+            flip_count = max(1, int(0.05 * max(len(edge_set), 1)))
+            for _ in range(flip_count):
+                candidate = rng.randrange(hg.num_nodes)
+                if candidate in edge_set:
+                    edge_set.remove(candidate)
+                else:
+                    edge_set.add(candidate)
+            perturbed.append(sorted(edge_set))
+        kept_edges = perturbed
     return SimpleHypergraph(
         num_nodes=hg.num_nodes,
         hyperedges=[list(edge) for edge in kept_edges],
@@ -186,5 +223,5 @@ def augment_hypergraph(hg: SimpleHypergraph, feature_mask_rate: float, edge_drop
         node_train_mask=hg.node_train_mask.clone() if hg.node_train_mask is not None else None,
         node_val_mask=hg.node_val_mask.clone() if hg.node_val_mask is not None else None,
         node_test_mask=hg.node_test_mask.clone() if hg.node_test_mask is not None else None,
-        metadata=dict(hg.metadata),
+        metadata={**metadata, "masked_nodes": node_mask},
     )

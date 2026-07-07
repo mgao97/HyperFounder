@@ -36,17 +36,12 @@ class TaskHeads(nn.Module):
     def __init__(
         self,
         hidden_dim: int,
-        node_classes: int,
-        motif_classes: int,
-        community_classes: int,
-        prototype_classes: int,
+        input_dim: int,
+        num_domains: int,
         projection_dim: int = 64,
     ):
         super().__init__()
-        self.node_head = MLPHead(hidden_dim, node_classes)
-        self.edge_head = MLPHead(hidden_dim, 1)
-        self.motif_head = MLPHead(hidden_dim, motif_classes)
-        self.community_head = MLPHead(hidden_dim, community_classes)
-        self.graph_projector = ProjectionHead(hidden_dim, projection_dim)
-        self.prototype_head = MLPHead(hidden_dim, prototype_classes)
-        self.structure_projection = nn.Linear(hidden_dim, hidden_dim)
+        self.masked_node_decoder = nn.Linear(hidden_dim, input_dim)
+        self.edge_size_regressor = nn.Linear(hidden_dim, 1)
+        self.node_projector = ProjectionHead(hidden_dim, projection_dim)
+        self.domain_classifier = nn.Linear(hidden_dim, num_domains)
