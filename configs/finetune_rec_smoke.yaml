@@ -4,7 +4,7 @@ model:
   dropout: 0.3
   num_layers: 2
   num_heads: 4
-  spectral_dim: 4
+  structure_pe_dim: 4
 
 training:
   seed: 7

@@ -5,6 +5,7 @@ from typing import Dict, List, Set
 import time
 
 import torch
+from tqdm.auto import tqdm
 
 from models.encoder import UnifiedHypergraphEncoder
 from models.heads import TaskHeads
@@ -29,9 +30,18 @@ class PretrainTrainer(TrainerBase):
             self.drop_tasks = {str(name) for name in configured_drop}
         else:
             self.drop_tasks = drop_tasks or set()
+        self.enabled_tasks = sorted(all_tasks.difference(self.drop_tasks))
+        progress_config = dict(config.get("training", {}).get("progress", {}))
+        self.show_epoch_bar = bool(progress_config.get("show_epoch_bar", True))
+        self.show_step_bar = bool(progress_config.get("show_step_bar", True))
+        self.show_pool_bar = bool(progress_config.get("show_pool_bar", True))
+        self.leave_progress_bar = bool(progress_config.get("leave_progress_bar", False))
+        self.progress_mininterval_sec = float(progress_config.get("mininterval_sec", 2.0))
+        self._log("Stage 1/4: loading domain graphs")
         self.domains = load_domain_graphs(config, seed=int(config["training"]["seed"]))
         self.graphs = iter_graphs(self.domains)
         hidden_dim = int(config["model"]["hidden_dim"])
+        self._log("Stage 2/4: building encoder and task heads")
         self.encoder = UnifiedHypergraphEncoder(
             in_dim=int(config["model"]["input_dim"]),
             hidden_dim=hidden_dim,
@@ -42,10 +52,12 @@ class PretrainTrainer(TrainerBase):
             num_domains=len(sorted(self.domains)) if self.domains else 1,
             domain_names=sorted(self.domains),
         ).to(self.device)
+        self.training_domains = sorted(self.domains)
+        self._pre_register_domain_projectors()
         self.heads = TaskHeads(
             hidden_dim=hidden_dim,
             input_dim=int(config["model"]["input_dim"]),
-            num_domains=max(len(sorted(self.domains)), 1),
+            num_domains=max(len(self.training_domains), 1),
         ).to(self.device)
         parameters = list(self.encoder.parameters()) + list(self.heads.parameters())
         self.optimizer = torch.optim.AdamW(
@@ -54,9 +66,9 @@ class PretrainTrainer(TrainerBase):
             weight_decay=float(config["training"]["weight_decay"]),
         )
         self.minibatch_config = dict(config["training"].get("minibatch", {}))
+        self._log("Stage 3/4: building subhypergraph pools")
         self.pool_cache = self._build_pool_cache()
         self.domain_sample_counts = {name: 0 for name in self.domains}
-        self.training_domains = sorted(self.domains)
         self.training_datasets = sorted({graph.dataset_name for graph in self.graphs})
         self._log_startup_info()
 
@@ -67,6 +79,22 @@ class PretrainTrainer(TrainerBase):
         if not counts:
             return "-"
         return ", ".join(f"{name}:{counts[name]}" for name in sorted(counts))
+
+    def _pre_register_domain_projectors(self) -> None:
+        for domain_name in self.training_domains:
+            domain_graphs = self.domains.get(domain_name, [])
+            if not domain_graphs:
+                continue
+            sample_graph = domain_graphs[0]
+            domain_id = self.training_domains.index(domain_name)
+            feature_type = str(sample_graph.metadata.get("feature_type", "numerical"))
+            feature_dim = int(sample_graph.x.size(-1))
+            self.encoder.projector.register_domain(
+                domain_id=domain_id,
+                node_dim=feature_dim,
+                edge_dim=feature_dim,
+                feature_type=feature_type,
+            )
 
     def _describe_batch_graphs(self, batch_graphs: List) -> str:
         parts = []
@@ -81,6 +109,10 @@ class PretrainTrainer(TrainerBase):
         dataset_names = ", ".join(self.training_datasets) if self.training_datasets else "-"
         domain_names = ", ".join(self.training_domains) if self.training_domains else "-"
         pooled_graphs = ", ".join(sorted(self.pool_cache)) if self.pool_cache else "-"
+        loss_weights = self.config.get("training", {}).get("loss_weights", {})
+        loss_weight_text = ", ".join(
+            f"{task}:{float(loss_weights.get(task, 1.0)):.3f}" for task in self.enabled_tasks
+        ) if self.enabled_tasks else "-"
         self._log(
             "Loaded datasets="
             f"[{dataset_names}] domains=[{domain_names}] "
@@ -90,11 +122,35 @@ class PretrainTrainer(TrainerBase):
             f"Prepared {len(self.graphs)} graphs across {len(self.training_domains)} domains; "
             f"subhypergraph_pool_graphs=[{pooled_graphs}]"
         )
+        self._log(
+            f"Stage 4/4: ready for training; enabled_tasks=[{', '.join(self.enabled_tasks)}] "
+            f"loss_weights=[{loss_weight_text}] log_step_history={bool(self.config['training'].get('log_step_history', False))}"
+        )
 
     def _build_pool_cache(self) -> Dict[str, List]:
         pool_cache: Dict[str, List] = {}
         base_seed = int(self.config["training"]["seed"])
-        for graph_index, hg in enumerate(self.graphs):
+        pool_targets = [
+            (graph_index, hg)
+            for graph_index, hg in enumerate(self.graphs)
+            if should_use_subhypergraph_pool(hg, self.minibatch_config)
+        ]
+        if not pool_targets:
+            self._log("No large graphs require subhypergraph pool precomputation.")
+            return pool_cache
+        iterator = pool_targets
+        pool_bar = None
+        if self.show_pool_bar:
+            pool_bar = tqdm(
+                pool_targets,
+                total=len(pool_targets),
+                desc="Pool build",
+                ascii=True,
+                leave=self.leave_progress_bar,
+                mininterval=self.progress_mininterval_sec,
+            )
+            iterator = pool_bar
+        for graph_index, hg in iterator:
             if not should_use_subhypergraph_pool(hg, self.minibatch_config):
                 continue
             pool_cache[hg.name] = build_subhypergraph_pool(
@@ -102,6 +158,14 @@ class PretrainTrainer(TrainerBase):
                 minibatch_config=self.minibatch_config,
                 seed=base_seed + graph_index * 1009,
             )
+            if pool_bar is not None:
+                pool_bar.set_postfix(
+                    graph=hg.dataset_name,
+                    pool=len(pool_cache[hg.name]),
+                    refresh=False,
+                )
+        if pool_bar is not None:
+            pool_bar.close()
         return pool_cache
 
     def _build_domain_schedule(self, epoch: int, steps_per_epoch: int) -> List[List[str]]:
@@ -153,7 +217,19 @@ class PretrainTrainer(TrainerBase):
             f"Training start: epochs={epochs}, steps_per_epoch={steps_per_epoch}, "
             f"log_interval_steps={log_interval_steps}, patience={patience}"
         )
-        for epoch in range(1, epochs + 1):
+        epoch_iterator = range(1, epochs + 1)
+        epoch_bar = None
+        if self.show_epoch_bar:
+            epoch_bar = tqdm(
+                epoch_iterator,
+                total=epochs,
+                desc="Pretrain epochs",
+                ascii=True,
+                leave=self.leave_progress_bar,
+                mininterval=self.progress_mininterval_sec,
+            )
+            epoch_iterator = epoch_bar
+        for epoch in epoch_iterator:
             self.encoder.train()
             self.heads.train()
             epoch_start = time.perf_counter()
@@ -174,7 +250,17 @@ class PretrainTrainer(TrainerBase):
             self._log(
                 f"Epoch {epoch}/{epochs} start: schedule_preview=[{schedule_preview}]"
             )
-            for step, step_domains in enumerate(domain_schedule):
+            step_iterator = enumerate(domain_schedule)
+            step_bar = None
+            if self.show_step_bar:
+                step_bar = tqdm(
+                    total=steps_per_epoch,
+                    desc=f"Epoch {epoch}/{epochs}",
+                    ascii=True,
+                    leave=self.leave_progress_bar,
+                    mininterval=self.progress_mininterval_sec,
+                )
+            for step, step_domains in step_iterator:
                 batch_graphs = sample_subhypergraph_batch(
                     self.domains,
                     minibatch_config=self.minibatch_config,
@@ -214,6 +300,14 @@ class PretrainTrainer(TrainerBase):
                     / max(len(batch_loss_dicts), 1)
                     for key in epoch_losses
                 }
+                if step_bar is not None:
+                    step_bar.update(1)
+                    step_bar.set_postfix(
+                        loss=f"{averaged_losses['total']:.4f}",
+                        domains=",".join(step_domains) if step_domains else "-",
+                        batch=len(batch_graphs),
+                        refresh=False,
+                    )
                 if log_step_history:
                     step_domain_counts = {name: 0 for name in self.training_domains}
                     for hg in batch_graphs:
@@ -248,6 +342,8 @@ class PretrainTrainer(TrainerBase):
                         f"domain_align={averaged_losses['domain_align']:.4f} "
                         f"batch_graphs=[{self._describe_batch_graphs(batch_graphs)}]"
                     )
+            if step_bar is not None:
+                step_bar.close()
             history.append(
                 {
                     "epoch": float(epoch),
@@ -263,6 +359,12 @@ class PretrainTrainer(TrainerBase):
                 f"domain_samples=[{self._format_domain_counts(epoch_domain_counts)}] "
                 f"best_total={min(best_loss, epoch_total):.4f} epoch_time_sec={epoch_time_sec:.2f}"
             )
+            if epoch_bar is not None:
+                epoch_bar.set_postfix(
+                    total=f"{epoch_total:.4f}",
+                    best=f"{min(best_loss, epoch_total):.4f}",
+                    refresh=False,
+                )
             if epoch_total < best_loss:
                 best_loss = epoch_total
                 best_epoch = epoch
@@ -279,6 +381,8 @@ class PretrainTrainer(TrainerBase):
                 if bad_epochs >= patience:
                     self._log(f"Early stopping triggered at epoch {epoch}.")
                     break
+        if epoch_bar is not None:
+            epoch_bar.close()
 
         train_time_sec = time.perf_counter() - train_start
         checkpoint_path = self._save_checkpoint("pretrain_last.pt")

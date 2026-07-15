@@ -4,24 +4,25 @@ model:
   dropout: 0.3
   num_layers: 2
   num_heads: 4
-  spectral_dim: 4
-
-tasks:
-  node_clusters: 4
-  motif_clusters: 4
-  community_clusters: 4
-  prototype_clusters: 4
+  structure_pe_dim: 4
 
 training:
   seed: 7
   device: cpu
-  epochs: 1
+  epochs: 10
   steps_per_epoch: 2
+  enabled_tasks:
+    - masked_node
+    - hyperedge_recon
+    - contrastive
+    - size_pred
+  log_step_history: false
   lr: 0.001
   weight_decay: 0.0001
   motif_budget: 4
   feature_mask_rate: 0.15
   edge_dropout_rate: 0.2
+  contrastive_strategy: node_dropping
   output_dir: outputs
   early_stopping:
     patience: 2
@@ -36,13 +37,11 @@ training:
     subhypergraph_pool_size: 4
     large_graph_node_threshold: 5000
   loss_weights:
-    struct: 1.0
-    node: 1.0
-    edge: 1.0
-    motif: 1.0
-    community: 0.5
-    global: 0.5
-    cross: 1.0
+    masked_node: 1.0
+    hyperedge_recon: 1.0
+    contrastive: 1.0
+    size_pred: 1.0
+    domain_align: 0.0
 
 data:
   datasets:
@@ -52,4 +51,3 @@ data:
     cora_cc: citation
     cooking_200: document
   cache_dir: data/cache
-
