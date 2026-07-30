@@ -36,7 +36,17 @@ class FinetuneTrainer(DownstreamTrainerBase):
         best_classifier_state = None
 
         max_epochs = int(self.config["training"]["finetune_epochs"])
+        log_interval = int(self.config["training"].get("log_interval_epochs", 10))
         train_start = time.perf_counter()
+        print(
+            "[HyperFounder][Transfer][Node] Train start:"
+            f" dataset={graph.dataset_name}"
+            f" epochs={max_epochs}"
+            f" patience={patience}"
+            f" train_nodes={int(graph.node_train_mask.sum().item())}"
+            f" val_nodes={int(graph.node_val_mask.sum().item())}"
+            f" test_nodes={int(graph.node_test_mask.sum().item())}"
+        )
         for epoch in range(max_epochs):
             encoder.train()
             classifier.train()
@@ -55,6 +65,11 @@ class FinetuneTrainer(DownstreamTrainerBase):
                 val_logits = classifier(node_emb)[graph.node_val_mask]
                 val_labels = graph.node_labels.to(self.device)[graph.node_val_mask]
                 val_score = multiclass_accuracy(val_logits, val_labels)
+            should_log = (
+                epoch == 0
+                or epoch == max_epochs - 1
+                or (epoch + 1) % max(log_interval, 1) == 0
+            )
 
             if val_score > best_val:
                 best_val = val_score
@@ -62,9 +77,35 @@ class FinetuneTrainer(DownstreamTrainerBase):
                 bad_epochs = 0
                 best_encoder_state = {k: v.detach().clone() for k, v in encoder.state_dict().items()}
                 best_classifier_state = {k: v.detach().clone() for k, v in classifier.state_dict().items()}
+                if should_log:
+                    print(
+                        "[HyperFounder][Transfer][Node] Epoch"
+                        f" {epoch + 1}/{max_epochs}:"
+                        f" loss={float(loss.item()):.4f}"
+                        f" val_acc={float(val_score):.4f}"
+                        f" best_val_acc={float(best_val):.4f}"
+                        f" bad_epochs={bad_epochs}/{patience}"
+                        " status=best"
+                    )
             else:
                 bad_epochs += 1
+                if should_log:
+                    print(
+                        "[HyperFounder][Transfer][Node] Epoch"
+                        f" {epoch + 1}/{max_epochs}:"
+                        f" loss={float(loss.item()):.4f}"
+                        f" val_acc={float(val_score):.4f}"
+                        f" best_val_acc={float(best_val):.4f}"
+                        f" bad_epochs={bad_epochs}/{patience}"
+                    )
                 if bad_epochs >= patience:
+                    print(
+                        "[HyperFounder][Transfer][Node] Early stop:"
+                        f" dataset={graph.dataset_name}"
+                        f" epoch={epoch + 1}"
+                        f" best_epoch={best_epoch + 1 if best_epoch >= 0 else -1}"
+                        f" best_val_acc={float(best_val):.4f}"
+                    )
                     break
         train_time_sec = time.perf_counter() - train_start
 
@@ -88,6 +129,15 @@ class FinetuneTrainer(DownstreamTrainerBase):
                 "finetune_train_time_sec": float(train_time_sec),
             }
         metrics["finetune_eval_time_sec"] = float(time.perf_counter() - eval_start)
+        print(
+            "[HyperFounder][Transfer][Node] Eval done:"
+            f" dataset={graph.dataset_name}"
+            f" acc={float(metrics['accuracy']):.4f}"
+            f" macro_f1={float(metrics['macro_f1']):.4f}"
+            f" best_epoch={int(metrics['best_epoch']) + 1 if int(metrics['best_epoch']) >= 0 else -1}"
+            f" train_time_sec={float(metrics['finetune_train_time_sec']):.2f}"
+            f" eval_time_sec={float(metrics['finetune_eval_time_sec']):.2f}"
+        )
         return metrics
 
     def run(self, task_name: str, heldout_domain: str) -> Dict[str, float | str]:
@@ -104,15 +154,42 @@ class FinetuneTrainer(DownstreamTrainerBase):
         dataset_results: List[Dict[str, float | str]] = []
         base_seed = int(self.config["training"]["seed"])
         num_seeds = int(self.config["training"].get("num_seeds", 3))
+        print(
+            "[HyperFounder][Transfer][Node] Run start:"
+            f" heldout_domain={resolved_domain}"
+            f" datasets={[graph.dataset_name for graph in target_graphs]}"
+            f" num_seeds={num_seeds}"
+        )
         for graph in target_graphs:
+            print(
+                "[HyperFounder][Transfer][Node] Dataset start:"
+                f" dataset={graph.dataset_name}"
+                f" num_nodes={graph.num_nodes}"
+                f" num_edges={len(graph.hyperedges)}"
+            )
             seed_scores: List[float] = []
             seed_f1_scores: List[float] = []
             seed_train_times: List[float] = []
             seed_eval_times: List[float] = []
             for seed_offset in range(num_seeds):
-                torch.manual_seed(base_seed + seed_offset)
+                run_seed = base_seed + seed_offset
+                torch.manual_seed(run_seed)
+                print(
+                    "[HyperFounder][Transfer][Node] Seed start:"
+                    f" dataset={graph.dataset_name}"
+                    f" seed={run_seed}"
+                    f" seed_index={seed_offset + 1}/{num_seeds}"
+                )
                 encoder = self.build_encoder()
                 metrics = self._run_node_task(encoder, graph)
+                print(
+                    "[HyperFounder][Transfer][Node] Seed done:"
+                    f" dataset={graph.dataset_name}"
+                    f" seed={run_seed}"
+                    f" acc={float(metrics['accuracy']):.4f}"
+                    f" macro_f1={float(metrics['macro_f1']):.4f}"
+                    f" best_val_acc={float(metrics['best_val_accuracy']):.4f}"
+                )
                 seed_scores.append(float(metrics["accuracy"]))
                 seed_f1_scores.append(float(metrics["macro_f1"]))
                 seed_train_times.append(float(metrics["finetune_train_time_sec"]))
@@ -133,6 +210,12 @@ class FinetuneTrainer(DownstreamTrainerBase):
                     **graph_train_summary,
                     **graph_eval_summary,
                 }
+            )
+            print(
+                "[HyperFounder][Transfer][Node] Dataset done:"
+                f" dataset={graph.dataset_name}"
+                f" acc={float(graph_summary[f'{task_name}_accuracy']):.4f}"
+                f" macro_f1={float(graph_f1_summary[f'{task_name}_macro_f1']):.4f}"
             )
         summary = summarize_seed_runs(graph_scores, metric_name=f"{task_name}_accuracy")
         summary.update(summarize_seed_runs(graph_f1_scores, metric_name=f"{task_name}_macro_f1"))

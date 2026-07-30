@@ -26,6 +26,13 @@ def main() -> None:
     config = load_yaml(args.config)
     set_seed(int(config["training"]["seed"]))
     task_name = config["training"]["task_name"]
+    print(
+        "[HyperFounder][Transfer] Start:"
+        f" task={task_name}"
+        f" heldout_domain={args.heldout_domain}"
+        f" config={args.config}"
+        f" seed={config['training']['seed']}"
+    )
     if task_name == "node":
         trainer = FinetuneTrainer(config)
     elif task_name in {"rec", "recommendation"}:
@@ -36,6 +43,12 @@ def main() -> None:
         raise ValueError(f"Unsupported task_name '{task_name}'.")
     summary = trainer.run(task_name=task_name, heldout_domain=args.heldout_domain)
     save_json(f"outputs/results/transfer_{task_name}_{args.heldout_domain}.json", summary)
+    print(
+        "[HyperFounder][Transfer] Finished:"
+        f" task={task_name}"
+        f" heldout_domain={args.heldout_domain}"
+        f" result_json=outputs/results/transfer_{task_name}_{args.heldout_domain}.json"
+    )
     print(summary)
 
 

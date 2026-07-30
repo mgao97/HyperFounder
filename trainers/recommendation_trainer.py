@@ -14,6 +14,25 @@ from utils.minibatch_sampling import expand_hyperedge_centered_subhypergraph
 
 
 class RecommendationTrainer(DownstreamTrainerBase):
+    def _log_eval_progress(self, dataset_name: str, split_name: str, offset: int, total_users: int, start_time: float) -> None:
+        if total_users <= 0:
+            return
+        checkpoints = {1, total_users}
+        checkpoints.add(max(1, total_users // 4))
+        checkpoints.add(max(1, total_users // 2))
+        checkpoints.add(max(1, (total_users * 3) // 4))
+        completed = offset + 1
+        if completed not in checkpoints:
+            return
+        elapsed = time.perf_counter() - start_time
+        print(
+            "[HyperFounder][Transfer][Rec] Eval progress:"
+            f" dataset={dataset_name}"
+            f" split={split_name}"
+            f" users={completed}/{total_users}"
+            f" elapsed_sec={elapsed:.2f}"
+        )
+
     def _prepare_graph(self, graph: SimpleHypergraph) -> SimpleHypergraph:
         train_adj = graph.metadata["train_adj_list"]
         test_adj = graph.metadata["test_adj_list"]
@@ -139,6 +158,7 @@ class RecommendationTrainer(DownstreamTrainerBase):
         targets: Sequence[int],
         eval_users: Sequence[int],
         seed: int,
+        split_name: str = "eval",
     ) -> Dict[str, float]:
         all_metrics: List[Dict[str, float]] = []
         eval_negative_samples = int(self.config["training"].get("eval_negative_samples", 99))
@@ -152,6 +172,13 @@ class RecommendationTrainer(DownstreamTrainerBase):
         encoder.eval()
         with torch.no_grad():
             for offset, user_id in enumerate(eval_users):
+                self._log_eval_progress(
+                    dataset_name=graph.dataset_name,
+                    split_name=split_name,
+                    offset=offset,
+                    total_users=len(eval_users),
+                    start_time=eval_start,
+                )
                 positive_items = [int(item_id) for item_id in targets[user_id] if int(item_id) >= 0]
                 if not positive_items:
                     continue
@@ -220,12 +247,22 @@ class RecommendationTrainer(DownstreamTrainerBase):
         users_per_epoch = min(int(self.config["training"].get("users_per_epoch", 256)), len(train_users))
         negatives_per_positive = int(self.config["training"].get("negatives_per_positive", 1))
         patience = int(self.config["training"].get("early_stopping", {}).get("patience", 50))
+        log_interval = int(self.config["training"].get("log_interval_epochs", 5))
         best_val = -1.0
         best_epoch = -1
         bad_epochs = 0
         best_encoder_state = None
 
         train_start = time.perf_counter()
+        print(
+            "[HyperFounder][Transfer][Rec] Train start:"
+            f" dataset={graph.dataset_name}"
+            f" epochs={int(self.config['training']['finetune_epochs'])}"
+            f" patience={patience}"
+            f" train_users={len(train_users)}"
+            f" val_users={len(val_users)}"
+            f" users_per_epoch={users_per_epoch}"
+        )
         for epoch in range(int(self.config["training"]["finetune_epochs"])):
             generator = torch.Generator().manual_seed(int(self.config["training"]["seed"]) + epoch * 97)
             permutation = torch.randperm(len(train_users), generator=generator).tolist()[:users_per_epoch]
@@ -233,6 +270,7 @@ class RecommendationTrainer(DownstreamTrainerBase):
             encoder.train()
             optimizer.zero_grad()
             batch_losses = []
+            epoch_start = time.perf_counter()
             for user_offset, user_id in enumerate(sampled_users):
                 positive_items = train_core[user_id]
                 positive_index = int(torch.randint(0, len(positive_items), (1,), generator=generator).item())
@@ -271,6 +309,9 @@ class RecommendationTrainer(DownstreamTrainerBase):
                 loss = torch.stack(batch_losses).mean()
                 loss.backward()
                 optimizer.step()
+                train_loss = float(loss.item())
+            else:
+                train_loss = 0.0
 
             if val_users:
                 val_metrics = self._evaluate_split(
@@ -279,18 +320,55 @@ class RecommendationTrainer(DownstreamTrainerBase):
                     targets=val_targets,
                     eval_users=val_users,
                     seed=int(self.config["training"]["seed"]) + epoch * 1000,
+                    split_name="val",
                 )
                 val_score = float(val_metrics["hr@10"])
             else:
+                val_metrics = {"finetune_eval_time_sec": 0.0}
                 val_score = 0.0
+            should_log = (
+                epoch == 0
+                or (epoch + 1) % max(log_interval, 1) == 0
+                or epoch == int(self.config["training"]["finetune_epochs"]) - 1
+            )
             if val_score > best_val:
                 best_val = val_score
                 best_epoch = epoch
                 bad_epochs = 0
                 best_encoder_state = {k: v.detach().clone() for k, v in encoder.state_dict().items()}
+                if should_log:
+                    print(
+                        "[HyperFounder][Transfer][Rec] Epoch"
+                        f" {epoch + 1}/{int(self.config['training']['finetune_epochs'])}:"
+                        f" train_loss={train_loss:.4f}"
+                        f" val_hr@10={val_score:.4f}"
+                        f" best_val_hr@10={best_val:.4f}"
+                        f" bad_epochs={bad_epochs}/{patience}"
+                        f" epoch_time_sec={time.perf_counter() - epoch_start:.2f}"
+                        f" eval_time_sec={float(val_metrics.get('finetune_eval_time_sec', 0.0)):.2f}"
+                        " status=best"
+                    )
             else:
                 bad_epochs += 1
+                if should_log:
+                    print(
+                        "[HyperFounder][Transfer][Rec] Epoch"
+                        f" {epoch + 1}/{int(self.config['training']['finetune_epochs'])}:"
+                        f" train_loss={train_loss:.4f}"
+                        f" val_hr@10={val_score:.4f}"
+                        f" best_val_hr@10={best_val:.4f}"
+                        f" bad_epochs={bad_epochs}/{patience}"
+                        f" epoch_time_sec={time.perf_counter() - epoch_start:.2f}"
+                        f" eval_time_sec={float(val_metrics.get('finetune_eval_time_sec', 0.0)):.2f}"
+                    )
                 if bad_epochs >= patience:
+                    print(
+                        "[HyperFounder][Transfer][Rec] Early stop:"
+                        f" dataset={graph.dataset_name}"
+                        f" epoch={epoch + 1}"
+                        f" best_epoch={best_epoch + 1 if best_epoch >= 0 else -1}"
+                        f" best_val_hr@10={best_val:.4f}"
+                    )
                     break
         train_time_sec = time.perf_counter() - train_start
         if best_encoder_state is not None:
@@ -302,6 +380,7 @@ class RecommendationTrainer(DownstreamTrainerBase):
             targets=graph.metadata["test_targets"],
             eval_users=test_users,
             seed=int(self.config["training"]["seed"]) + 999999,
+            split_name="test",
         )
         test_metrics.update(
             {
@@ -309,6 +388,16 @@ class RecommendationTrainer(DownstreamTrainerBase):
                 "best_epoch": float(best_epoch),
                 "finetune_train_time_sec": float(train_time_sec),
             }
+        )
+        print(
+            "[HyperFounder][Transfer][Rec] Eval done:"
+            f" dataset={graph.dataset_name}"
+            f" hr@5={float(test_metrics['hr@5']):.4f}"
+            f" hr@10={float(test_metrics['hr@10']):.4f}"
+            f" ndcg@10={float(test_metrics['ndcg@10']):.4f}"
+            f" best_epoch={int(test_metrics['best_epoch']) + 1 if int(test_metrics['best_epoch']) >= 0 else -1}"
+            f" train_time_sec={float(test_metrics['finetune_train_time_sec']):.2f}"
+            f" eval_time_sec={float(test_metrics['finetune_eval_time_sec']):.2f}"
         )
         return test_metrics
 
@@ -322,12 +411,39 @@ class RecommendationTrainer(DownstreamTrainerBase):
         dataset_results: List[Dict[str, float | str]] = []
         base_seed = int(self.config["training"]["seed"])
         num_seeds = int(self.config["training"].get("num_seeds", 3))
+        print(
+            "[HyperFounder][Transfer][Rec] Run start:"
+            f" heldout_domain={resolved_domain}"
+            f" datasets={[graph.dataset_name for graph in target_graphs]}"
+            f" num_seeds={num_seeds}"
+        )
         for graph in target_graphs:
+            print(
+                "[HyperFounder][Transfer][Rec] Dataset start:"
+                f" dataset={graph.dataset_name}"
+                f" num_nodes={graph.num_nodes}"
+                f" num_edges={len(graph.hyperedges)}"
+            )
             seed_metrics: Dict[str, List[float]] = {name: [] for name in metric_names}
             for seed_offset in range(num_seeds):
-                torch.manual_seed(base_seed + seed_offset)
+                run_seed = base_seed + seed_offset
+                torch.manual_seed(run_seed)
+                print(
+                    "[HyperFounder][Transfer][Rec] Seed start:"
+                    f" dataset={graph.dataset_name}"
+                    f" seed={run_seed}"
+                    f" seed_index={seed_offset + 1}/{num_seeds}"
+                )
                 encoder = self.build_encoder()
                 metrics = self._run_recommendation_task(encoder, graph)
+                print(
+                    "[HyperFounder][Transfer][Rec] Seed done:"
+                    f" dataset={graph.dataset_name}"
+                    f" seed={run_seed}"
+                    f" hr@10={float(metrics['hr@10']):.4f}"
+                    f" ndcg@10={float(metrics['ndcg@10']):.4f}"
+                    f" best_val_hr@10={float(metrics['best_val_hr@10']):.4f}"
+                )
                 for metric_name in metric_names:
                     seed_metrics[metric_name].append(float(metrics[metric_name]))
             dataset_summary: Dict[str, float | str] = {"dataset_name": graph.dataset_name}
@@ -336,6 +452,12 @@ class RecommendationTrainer(DownstreamTrainerBase):
                 dataset_summary.update(metric_summary)
                 aggregate[metric_name].append(float(metric_summary[metric_name]))
             dataset_results.append(dataset_summary)
+            print(
+                "[HyperFounder][Transfer][Rec] Dataset done:"
+                f" dataset={graph.dataset_name}"
+                f" hr@10={float(dataset_summary['hr@10']):.4f}"
+                f" ndcg@10={float(dataset_summary['ndcg@10']):.4f}"
+            )
 
         summary: Dict[str, float | str] = {
             "heldout_domain": resolved_domain,
