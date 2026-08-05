@@ -26,7 +26,7 @@ def algo_preprocessing(data,args,ehnn_cache_path=None):
         data = legcn_preprocessing(data,args)  # line_expansion
     elif method in ['hnhn']:
         data = generate_HNHN_norm(data,args)
-    elif method in ['phennomnn', 'phennomnns', 'phennomnn']:
+    elif method in ['phenomnn', 'phenomnns', 'phenomnn']:
         data = phenomNN_preprocessing(data,args)
     elif method == 'hjrl':
         data = hjrl_preprocessing(data,args)
@@ -42,7 +42,7 @@ def algo_preprocessing(data,args,ehnn_cache_path=None):
         )
     elif method in ['plainunigencoder']:
         data =uni_expansion(data,args)
-    elif method in ['hypergt', 'hypergt']:
+    elif method in ['hypergt']:
         data = hypergt_preprocessing(data,args)
     elif method in ['cegcn','cegat']:
         data = cegnn_preprocessing(data,args)
@@ -330,7 +330,8 @@ def phenomNN_preprocessing(data,args):
 
     H = create_coo_from_edge_index(data.hyperedge_index)
 
-    if args.method == 'PhenomNN':
+    method_lower = args.method.lower() if hasattr(args.method, 'lower') else str(args.method).lower()
+    if method_lower == 'phenomnn':
         A_beta,D_beta,I=phenomNN_expansion(H,args,norm_type="node")
         A_gamma,D_gamma,_=phenomNN_expansion(H,args,norm_type="full")
         H_expansion=[A_beta,A_gamma]
