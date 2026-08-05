@@ -1,0 +1,35 @@
+# Finetune config using standard datasets (not cocitation) for fair comparison with HGNN
+model:
+  input_dim: 128
+  hidden_dim: 128
+  dropout: 0.3
+  num_layers: 4
+  num_heads: 8
+  structure_pe_dim: 8
+
+training:
+  seed: 7
+  device: cuda
+  lr: 0.001
+  weight_decay: 0.0005
+  finetune_epochs: 200  # Reduce for faster testing
+  num_seeds: 3
+  early_stopping:
+    patience: 50
+  output_dir: outputs
+  pretrained_checkpoint: outputs/checkpoints/pretrain_best.pt  # Use pretrained checkpoint
+  task_name: node
+
+data:
+  datasets:
+    - cora
+    - citeseer
+    - pubmed
+  domain_map:
+    cora: citation
+    citeseer: citation
+    pubmed: citation
+  cache_dir: data/cache
+  splits:
+    train_ratio: 0.6
+    val_ratio: 0.2

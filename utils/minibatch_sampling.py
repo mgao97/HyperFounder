@@ -1,10 +1,234 @@
 from __future__ import annotations
 
-from typing import Dict, List, Sequence
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Sequence
 
 import torch
 
 from utils.hypergraph import SimpleHypergraph
+
+
+@dataclass
+class SubhypergraphMeta:
+    """Enhanced metadata for sampled sub-hypergraphs."""
+    # Basic counts
+    num_nodes: int
+    num_edges: int
+    
+    # Structural statistics
+    incidence_nnz: int
+    component_ratio: float
+    overlap_density: float
+    cardinality_mean: float
+    cardinality_std: float
+    
+    # Quality assessment
+    validity_flag: bool
+    quality_score: float
+    
+    # Routing decision
+    routing: Dict[str, bool]
+    
+    # Additional info
+    domain_id: int
+    parent_graph_name: str
+    
+    def to_dict(self) -> Dict:
+        return {
+            "num_nodes": self.num_nodes,
+            "num_edges": self.num_edges,
+            "incidence_nnz": self.incidence_nnz,
+            "component_ratio": self.component_ratio,
+            "overlap_density": self.overlap_density,
+            "cardinality_mean": self.cardinality_mean,
+            "cardinality_std": self.cardinality_std,
+            "validity_flag": self.validity_flag,
+            "quality_score": self.quality_score,
+            "routing": self.routing,
+            "domain_id": self.domain_id,
+        }
+
+
+def compute_subhypergraph_quality(
+    hg: SimpleHypergraph,
+    min_nodes: int = 4,
+    min_edges: int = 2,
+    tau_hyperedge: float = 0.55,
+    tau_motif: float = 0.70,
+    tau_membership: float = 0.40,
+    tau_hard_negative: float = 0.40,
+    domain_id: int = 0,
+) -> SubhypergraphMeta:
+    """
+    Compute quality score and metadata for a sampled sub-hypergraph.
+    
+    Returns:
+        SubhypergraphMeta with quality score and routing decision
+    """
+    num_nodes = hg.num_nodes
+    num_edges = len(hg.hyperedges)
+    
+    # Compute incidence statistics
+    incidence = hg.incidence_matrix()
+    if incidence.is_sparse:
+        dense_inc = incidence.to_dense()
+    else:
+        dense_inc = incidence
+    
+    incidence_nnz = int((dense_inc > 0).sum().item())
+    
+    # Validity check
+    validity_flag = (
+        num_nodes >= min_nodes
+        and num_edges >= min_edges
+        and incidence_nnz > 0
+    )
+    
+    # Component ratio
+    if num_nodes > 0 and num_edges > 0:
+        nodes_with_edges = (dense_inc.sum(dim=1) > 0).sum().item()
+        component_ratio = nodes_with_edges / num_nodes
+    else:
+        component_ratio = 0.0
+    
+    # Overlap density
+    overlap_density = 0.0
+    if num_edges >= 2:
+        edge_overlaps = []
+        for i in range(num_edges):
+            for j in range(i + 1, num_edges):
+                overlap = (dense_inc[:, i] * dense_inc[:, j]).sum().item()
+                edge_overlaps.append(overlap)
+        if edge_overlaps:
+            overlap_density = sum(edge_overlaps) / len(edge_overlaps)
+            overlap_density = min(overlap_density / max(num_nodes, 1), 1.0)
+    
+    # Cardinality statistics
+    cardinalities = dense_inc.sum(dim=0)
+    cardinality_mean = cardinalities.float().mean().item() if cardinalities.numel() > 0 else 0.0
+    cardinality_std = cardinalities.float().std().item() if cardinalities.numel() > 1 else 0.0
+    
+    # Compute quality score
+    quality_score = _compute_quality_score(
+        validity_flag=validity_flag,
+        num_nodes=num_nodes,
+        num_edges=num_edges,
+        component_ratio=component_ratio,
+        overlap_density=overlap_density,
+        incidence_nnz=incidence_nnz,
+    )
+    
+    # Compute routing decision
+    routing = _get_task_routing_decision(
+        quality_score=quality_score,
+        validity_flag=validity_flag,
+        num_nodes=num_nodes,
+        tau_hyperedge=tau_hyperedge,
+        tau_motif=tau_motif,
+        tau_membership=tau_membership,
+        tau_hard_negative=tau_hard_negative,
+    )
+    
+    return SubhypergraphMeta(
+        num_nodes=num_nodes,
+        num_edges=num_edges,
+        incidence_nnz=incidence_nnz,
+        component_ratio=component_ratio,
+        overlap_density=overlap_density,
+        cardinality_mean=cardinality_mean,
+        cardinality_std=cardinality_std,
+        validity_flag=validity_flag,
+        quality_score=quality_score,
+        routing=routing,
+        domain_id=domain_id,
+        parent_graph_name=hg.name,
+    )
+
+
+def _compute_quality_score(
+    validity_flag: bool,
+    num_nodes: int,
+    num_edges: int,
+    component_ratio: float,
+    overlap_density: float,
+    incidence_nnz: int,
+) -> float:
+    """Compute combined quality score."""
+    if not validity_flag:
+        return 0.0
+    
+    # Size score
+    size_score = min(num_nodes / 32.0, 1.0) * min(num_edges / 8.0, 1.0)
+    size_score = min(size_score, 1.0)
+    
+    # Connectivity score
+    connectivity_score = min(component_ratio / 0.9, 1.0)
+    
+    # Overlap score
+    overlap_score = min(overlap_density / 0.1, 1.0)
+    
+    # Density score
+    max_nnz = num_nodes * num_edges if num_nodes > 0 and num_edges > 0 else 1
+    density_score = incidence_nnz / max(max_nnz, 1)
+    
+    # Weighted combination
+    quality = (
+        0.25 * size_score +
+        0.30 * connectivity_score +
+        0.25 * overlap_score +
+        0.20 * density_score
+    )
+    
+    return min(max(quality, 0.0), 1.0)
+
+
+def _get_task_routing_decision(
+    quality_score: float,
+    validity_flag: bool,
+    num_nodes: int,
+    tau_hyperedge: float = 0.55,
+    tau_motif: float = 0.70,
+    tau_membership: float = 0.40,
+    tau_hard_negative: float = 0.40,
+) -> Dict[str, bool]:
+    """Determine which tasks to apply based on quality."""
+    routing = {
+        "valid": validity_flag,
+        "membership": False,
+        "hyperedge_recon": False,
+        "contrastive": False,
+        "motif": False,
+        "community": False,
+        "structure_discrimination": False,
+        "hard_negative": False,
+        "exclude": not validity_flag,
+    }
+    
+    if not validity_flag:
+        return routing
+    
+    # Hard negative: weak but valid
+    if quality_score < tau_hard_negative:
+        routing["hard_negative"] = True
+        routing["exclude"] = False
+        return routing
+    
+    # Membership
+    if quality_score >= tau_membership and num_nodes >= 2:
+        routing["membership"] = True
+    
+    # Hyperedge recon + contrastive
+    if quality_score >= tau_hyperedge:
+        routing["hyperedge_recon"] = True
+        routing["contrastive"] = True
+    
+    # Motif/community
+    if quality_score >= tau_motif:
+        routing["motif"] = True
+        routing["community"] = True
+        routing["structure_discrimination"] = True
+    
+    return routing
 
 
 def sample_seed_hyperedges(hg: SimpleHypergraph, num_seeds: int, seed: int) -> List[int]:
@@ -175,6 +399,32 @@ def sample_subhypergraph_batch(
     seed: int,
     preferred_domains: Sequence[str] | None = None,
 ) -> List[SimpleHypergraph]:
+    """Sample a batch of sub-hypergraphs (legacy version)."""
+    batch = sample_subhypergraph_batch_with_quality(
+        domains=domains,
+        minibatch_config=minibatch_config,
+        pool_cache=pool_cache,
+        seed=seed,
+        preferred_domains=preferred_domains,
+    )
+    return [item["subhypergraph"] for item in batch]
+
+
+def sample_subhypergraph_batch_with_quality(
+    domains: Dict[str, List[SimpleHypergraph]],
+    minibatch_config: Dict,
+    pool_cache: Dict[str, List[SimpleHypergraph]],
+    seed: int,
+    preferred_domains: Sequence[str] | None = None,
+) -> List[Dict]:
+    """
+    Sample a batch of sub-hypergraphs with quality metadata.
+    
+    Returns:
+        List of dicts with keys:
+        - subhypergraph: SimpleHypergraph
+        - quality_meta: SubhypergraphMeta
+    """
     requested = set(preferred_domains) if preferred_domains is not None else None
     available_domains = [domain for domain, graphs in domains.items() if graphs and (requested is None or domain in requested)]
     if not available_domains:
@@ -187,9 +437,20 @@ def sample_subhypergraph_batch(
         domain_indices = torch.randperm(len(available_domains), generator=generator)[:domains_per_step].tolist()
         chosen_domains = [available_domains[index] for index in domain_indices]
 
-    sampled: List[SimpleHypergraph] = []
+    sampled: List[Dict] = []
+    
+    # Get quality routing thresholds from config
+    tau_hyperedge = float(minibatch_config.get("tau_hyperedge", 0.55))
+    tau_motif = float(minibatch_config.get("tau_motif", 0.70))
+    tau_membership = float(minibatch_config.get("tau_membership", 0.40))
+    tau_hard_negative = float(minibatch_config.get("tau_hard_negative", 0.40))
+    min_membership_nodes = int(minibatch_config.get("min_membership_nodes", 2))
+    min_nodes = int(minibatch_config.get("min_nodes", 4))
+    min_edges = int(minibatch_config.get("min_edges", 2))
+    
     for domain_offset, domain_name in enumerate(chosen_domains):
         graphs = domains[domain_name]
+        domain_id = list(domains.keys()).index(domain_name)
         subhypergraphs_per_domain = int(minibatch_config.get("subhypergraphs_per_domain", 2))
         graph_indices = torch.randint(0, len(graphs), (subhypergraphs_per_domain,), generator=generator).tolist()
         for subhypergraph_offset, graph_index in enumerate(graph_indices):
@@ -197,8 +458,29 @@ def sample_subhypergraph_batch(
             if should_use_subhypergraph_pool(graph, minibatch_config) and pool_cache.get(graph.name):
                 pool = pool_cache[graph.name]
                 pool_index = int(torch.randint(0, len(pool), (1,), generator=generator).item())
-                sampled.append(pool[pool_index])
+                subhg = pool[pool_index]
+            else:
+                local_seed = seed + domain_offset * 101 + subhypergraph_offset * 17 + graph_index
+                subhg = sample_online_subhypergraph(graph, minibatch_config=minibatch_config, seed=local_seed)
+            
+            if subhg.num_nodes == 0 or not subhg.hyperedges:
                 continue
-            local_seed = seed + domain_offset * 101 + subhypergraph_offset * 17 + graph_index
-            sampled.append(sample_online_subhypergraph(graph, minibatch_config=minibatch_config, seed=local_seed))
-    return [subhypergraph for subhypergraph in sampled if subhypergraph.num_nodes > 0 and subhypergraph.hyperedges]
+            
+            # Compute quality metadata
+            quality_meta = compute_subhypergraph_quality(
+                hg=subhg,
+                min_nodes=min_nodes,
+                min_edges=min_edges,
+                tau_hyperedge=tau_hyperedge,
+                tau_motif=tau_motif,
+                tau_membership=tau_membership,
+                tau_hard_negative=tau_hard_negative,
+                domain_id=domain_id,
+            )
+            
+            sampled.append({
+                "subhypergraph": subhg,
+                "quality_meta": quality_meta,
+            })
+    
+    return sampled

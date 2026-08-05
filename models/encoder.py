@@ -8,6 +8,7 @@ from torch import nn
 from models.cross_domain_modules import (
     CrossDomainFeatureProjectionModule,
     CrossDomainStructuralPEModule,
+    DynamicDomainAdapter,
     EncoderLayer,
     EncoderLayerConfig,
     HierarchicalHypergraphPooling,
@@ -31,6 +32,10 @@ class UnifiedHypergraphEncoder(nn.Module):
         topk: int = 16,
         pooled_nodes: int = 64,
         pooled_edges: int = 32,
+        use_domain_adapter: bool = True,
+        adapter_type: str = "adapter",
+        adapter_dim: int = 32,
+        num_experts: int = 4,
     ):
         super().__init__()
         pe_dim = max(int(structure_pe_dim), 1)
@@ -58,6 +63,21 @@ class UnifiedHypergraphEncoder(nn.Module):
         )
         self.readout_projection = nn.Linear(hidden_dim * 2, hidden_dim)
         self.subhypergraph_projection = nn.Linear(hidden_dim * 2, hidden_dim)
+        
+        # Dynamic domain adapter for domain-specific adaptation
+        self.use_domain_adapter = use_domain_adapter
+        self.adapter_type = adapter_type
+        if use_domain_adapter:
+            self.domain_adapter = DynamicDomainAdapter(
+                hidden_dim=hidden_dim,
+                num_domains=num_domains,
+                adapter_type=adapter_type,
+                adapter_dim=adapter_dim,
+                num_experts=num_experts,
+            )
+        else:
+            self.domain_adapter = None
+        
         if domain_names is None:
             self.domain_to_id: Dict[str, int] = {}
         else:
@@ -145,6 +165,15 @@ class UnifiedHypergraphEncoder(nn.Module):
 
         node_emb = torch.nan_to_num(node_tokens, nan=0.0, posinf=0.0, neginf=0.0)
         edge_emb = torch.nan_to_num(edge_tokens, nan=0.0, posinf=0.0, neginf=0.0)
+
+        # Apply domain adapter for domain-specific adaptation
+        if self.domain_adapter is not None:
+            domain_id_int = int(data.domain_id) if hasattr(data, 'domain_id') else 0
+            node_adapter_out = self.domain_adapter(node_emb, domain_id_int)
+            edge_adapter_out = self.domain_adapter(edge_emb, domain_id_int)
+            # Residual-like combination: shared + adapter
+            node_emb = node_emb + node_adapter_out
+            edge_emb = edge_emb + edge_adapter_out
 
         pooled_nodes, pooled_edges, pooled_incidence = self.pooling_module(node_emb, edge_emb, incidence)
         node_graph = pooled_nodes.mean(dim=0) if pooled_nodes.numel() else node_emb.mean(dim=0)

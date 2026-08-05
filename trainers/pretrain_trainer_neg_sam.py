@@ -14,13 +14,19 @@ from trainers.trainer_base import TrainerBase
 from utils.dhg_datasets import load_domain_graphs
 from utils.eval import write_loss_history
 from utils.hypergraph import iter_graphs
-from utils.minibatch_sampling import build_subhypergraph_pool, sample_subhypergraph_batch, should_use_subhypergraph_pool
+from utils.minibatch_sampling import build_subhypergraph_pool, sample_subhypergraph_batch, sample_subhypergraph_batch_with_quality, should_use_subhypergraph_pool
+from utils.negative_bank import HardNegativeBank, QualityAwareNegativeSampler
 
 
 class PretrainTrainerNegSam(TrainerBase):
     def __init__(self, config: Dict, drop_tasks: Set[str] | None = None):
         super().__init__(config, ensure_subdirs=("checkpoints", "logs", "results"))
-        all_tasks = {"masked_node", "hyperedge_recon", "contrastive", "size_pred", "domain_align", "membership_contrast"}
+        all_tasks = {
+            "masked_node", "hyperedge_recon", "contrastive", "size_pred",
+            "domain_align", "membership_contrast", "motif", "community",
+            "structure_align", "structure_discrimination",
+            "orth_node", "orth_edge", "private_domain_node", "private_domain_edge",
+        }
         enabled = config.get("training", {}).get("enabled_tasks")
         configured_drop = config.get("training", {}).get("drop_tasks")
         if enabled is not None:
@@ -41,6 +47,13 @@ class PretrainTrainerNegSam(TrainerBase):
         self.domains = load_domain_graphs(config, seed=int(config["training"]["seed"]))
         self.graphs = iter_graphs(self.domains)
         hidden_dim = int(config["model"]["hidden_dim"])
+        
+        # Domain adapter settings
+        use_domain_adapter = bool(config["model"].get("use_domain_adapter", True))
+        adapter_type = str(config["model"].get("adapter_type", "adapter"))
+        adapter_dim = int(config["model"].get("adapter_dim", 32))
+        num_experts = int(config["model"].get("num_experts", 4))
+        
         self._log("Stage 2/4: building encoder and negative-sampling task heads")
         self.encoder = UnifiedHypergraphEncoder(
             in_dim=int(config["model"]["input_dim"]),
@@ -51,25 +64,83 @@ class PretrainTrainerNegSam(TrainerBase):
             structure_pe_dim=int(config["model"].get("structure_pe_dim", config["model"].get("spectral_dim", 0))),
             num_domains=len(sorted(self.domains)) if self.domains else 1,
             domain_names=sorted(self.domains),
+            use_domain_adapter=use_domain_adapter,
+            adapter_type=adapter_type,
+            adapter_dim=adapter_dim,
+            num_experts=num_experts,
         ).to(self.device)
         self.training_domains = sorted(self.domains)
         self._pre_register_domain_projectors()
+        
+        # Task head settings
+        num_motif_types = int(config["training"].get("num_motif_types", 8))
+        num_prototypes = int(config["training"].get("num_prototypes", 8))
+        
+        # Challenge 1: Disentanglement & Alignment settings
+        shared_dim = int(config["training"].get("shared_dim", hidden_dim))
+        private_dim = int(config["training"].get("private_dim", hidden_dim))
+        lambda_orth = float(config["training"].get("lambda_orth", 0.02))
+        lambda_private_domain = float(config["training"].get("lambda_private_domain", 0.05))
+        lambda_align = float(config["training"].get("lambda_align", 0.1))
+        use_confidence_routing = bool(config["training"].get("use_confidence_routing", True))
+        use_node_alignment = bool(config["training"].get("use_node_alignment", True))
+        use_edge_alignment = bool(config["training"].get("use_edge_alignment", True))
+        tau_node_align = float(config["training"].get("tau_node_align", 0.6))
+        tau_edge_align = float(config["training"].get("tau_edge_align", 0.65))
+        
         self.heads = TaskHeadsNegSam(
             hidden_dim=hidden_dim,
             input_dim=int(config["model"]["input_dim"]),
             num_domains=max(len(self.training_domains), 1),
+            num_motif_types=num_motif_types,
+            num_prototypes=num_prototypes,
+            # Challenge 1 settings
+            shared_dim=shared_dim,
+            private_dim=private_dim,
+            lambda_orth=lambda_orth,
+            lambda_private_domain=lambda_private_domain,
+            lambda_align=lambda_align,
+            use_confidence_routing=use_confidence_routing,
+            use_node_alignment=use_node_alignment,
+            use_edge_alignment=use_edge_alignment,
+            tau_node_align=tau_node_align,
+            tau_edge_align=tau_edge_align,
         ).to(self.device)
+        
+        # Log actual device info
+        encoder_device = next(self.encoder.parameters()).device
+        heads_device = next(self.heads.parameters()).device
+        self._log(f"Model devices: encoder={encoder_device}, heads={heads_device}")
+        if torch.cuda.is_available():
+            self._log(f"CUDA info: device_count={torch.cuda.device_count()}, current_device={torch.cuda.current_device()}, device_name={torch.cuda.get_device_name()}")
+        
         parameters = list(self.encoder.parameters()) + list(self.heads.parameters())
         self.optimizer = torch.optim.AdamW(
             parameters,
             lr=float(config["training"]["lr"]),
             weight_decay=float(config["training"]["weight_decay"]),
         )
-        self.minibatch_config = dict(config["training"].get("minibatch", {}))
+        self.minibatch_config = dict(config.get("training", {}).get("minibatch", {}))
         self._log("Stage 3/4: building subhypergraph pools")
         self.pool_cache = self._build_pool_cache()
         self.domain_sample_counts = {name: 0 for name in self.domains}
         self.training_datasets = sorted({graph.dataset_name for graph in self.graphs})
+        
+        # Challenge 2: Hard Negative Bank
+        training_cfg = config.get("training", {})
+        self.use_hard_negative_bank = bool(training_cfg.get("use_hard_negative_bank", True))
+        self.log_quality_stats = bool(training_cfg.get("log_quality_stats", True))
+        if self.use_hard_negative_bank:
+            self.hard_negative_bank = HardNegativeBank(
+                max_size=int(training_cfg.get("hard_negative_bank_size", 1000)),
+                num_tiers=int(training_cfg.get("hard_negative_num_tiers", 3)),
+                num_domains=len(self.training_domains),
+                sampling_strategy=str(training_cfg.get("hard_negative_sampling_strategy", "quality_weighted")),
+            )
+            self._log(f"Initialized HardNegativeBank: size={self.hard_negative_bank.max_size}")
+        else:
+            self.hard_negative_bank = None
+        
         self._log_startup_info()
 
     def _log(self, message: str) -> None:
@@ -232,9 +303,18 @@ class PretrainTrainerNegSam(TrainerBase):
                 "size_pred": 0.0,
                 "domain_align": 0.0,
                 "membership_contrast": 0.0,
+                "motif": 0.0,
+                "community": 0.0,
+                "structure_align": 0.0,
+                "structure_discrimination": 0.0,
+                "orth_node": 0.0,
+                "orth_edge": 0.0,
+                "private_domain_node": 0.0,
+                "private_domain_edge": 0.0,
                 "total": 0.0,
             }
             epoch_stats = {
+                # Negative sampling stats
                 "num_hyperedge_negatives": 0.0,
                 "num_membership_negatives": 0.0,
                 "num_subgraph_negatives": 0.0,
@@ -244,6 +324,15 @@ class PretrainTrainerNegSam(TrainerBase):
                 "avg_membership_hop": 0.0,
                 "avg_subgraph_strength_pos": 0.0,
                 "avg_subgraph_strength_neg": 0.0,
+                # Challenge 2: Quality stats
+                "num_valid_samples": 0.0,
+                "num_invalid_samples": 0.0,
+                "num_hard_negatives": 0.0,
+                "avg_quality_score": 0.0,
+                "num_membership_routed": 0.0,
+                "num_hyperedge_routed": 0.0,
+                "num_motif_routed": 0.0,
+                "num_hard_negative_bank": 0.0,
             }
             domain_schedule = self._build_domain_schedule(epoch, steps_per_epoch)
             schedule_preview = " | ".join(
@@ -261,13 +350,21 @@ class PretrainTrainerNegSam(TrainerBase):
                     mininterval=self.progress_mininterval_sec,
                 )
             for step, step_domains in enumerate(domain_schedule):
-                batch_graphs = sample_subhypergraph_batch(
-                    self.domains,
+                # Use quality-aware batch sampling
+                batch_items = sample_subhypergraph_batch_with_quality(
+                    domains=self.domains,
                     minibatch_config=self.minibatch_config,
                     pool_cache=self.pool_cache,
                     seed=base_seed + epoch * 10000 + step,
                     preferred_domains=step_domains,
                 )
+                if not batch_items:
+                    continue
+                
+                # Separate graphs and quality metadata
+                batch_graphs = [item["subhypergraph"] for item in batch_items]
+                batch_qualities = [item["quality_meta"] for item in batch_items]
+                
                 if not batch_graphs:
                     continue
                 for batch_index, hg in enumerate(batch_graphs):
@@ -277,7 +374,9 @@ class PretrainTrainerNegSam(TrainerBase):
                 self.optimizer.zero_grad()
                 batch_loss_dicts = []
                 batch_stats = []
-                for hg in batch_graphs:
+                batch_quality_stats = []
+                
+                for batch_index, hg in enumerate(batch_graphs):
                     hg.metadata["domain_id"] = self.training_domains.index(hg.domain) if hg.domain in self.training_domains else 0
                     loss_dict = compute_pretraining_losses(
                         encoder=self.encoder,
@@ -291,21 +390,32 @@ class PretrainTrainerNegSam(TrainerBase):
                     )
                     batch_stats.append(dict(loss_dict.get("stats", {})))
                     batch_loss_dicts.append({key: value for key, value in loss_dict.items() if key != "stats"})
-                total_loss = torch.stack([loss_dict["total"] for loss_dict in batch_loss_dicts]).mean()
-                total_loss.backward()
-                self.optimizer.step()
-                averaged_losses = {
-                    key: sum(float(loss_dict[key].detach().cpu().item()) for loss_dict in batch_loss_dicts)
-                    / max(len(batch_loss_dicts), 1)
-                    for key in epoch_losses
-                }
-                averaged_stats = {
-                    key: sum(float(stat_dict.get(key, 0.0)) for stat_dict in batch_stats) / max(len(batch_stats), 1)
-                    for key in epoch_stats
-                }
-                if step_bar is not None:
-                    step_bar.update(1)
-                    step_bar.set_postfix(
+                    
+                    # Collect quality stats
+                    quality_meta = batch_qualities[batch_index]
+                    routing = quality_meta.routing
+                    quality_stats = {
+                        "num_valid_samples": 1.0 if routing["valid"] else 0.0,
+                        "num_invalid_samples": 1.0 if not routing["valid"] else 0.0,
+                        "num_hard_negatives": 1.0 if routing["hard_negative"] else 0.0,
+                        "avg_quality_score": quality_meta.quality_score,
+                        "num_membership_routed": 1.0 if routing["membership"] else 0.0,
+                        "num_hyperedge_routed": 1.0 if routing["hyperedge_recon"] else 0.0,
+                        "num_motif_routed": 1.0 if routing["motif"] else 0.0,
+                        "num_hard_negative_bank": 1.0 if routing["hard_negative"] else 0.0,
+                    }
+                    batch_quality_stats.append(quality_stats)
+                    
+                    # Add to hard negative bank if applicable
+                    if self.hard_negative_bank is not None and routing["hard_negative"]:
+                        self.hard_negative_bank.add(
+                            subhypergraph_data={"name": hg.name, "domain": hg.domain},
+                            quality_score=quality_meta.quality_score,
+                            domain_id=quality_meta.domain_id,
+                        )
+                    if step_bar is not None:
+                        step_bar.update(1)
+                        step_bar.set_postfix(
                         loss=f"{averaged_losses['total']:.4f}",
                         neg=f"{averaged_stats['num_hyperedge_negatives']:.1f}/{averaged_stats['num_membership_negatives']:.1f}",
                         refresh=False,
@@ -342,6 +452,9 @@ class PretrainTrainerNegSam(TrainerBase):
                         f"size_pred={averaged_losses['size_pred']:.4f} "
                         f"domain_align={averaged_losses['domain_align']:.4f} "
                         f"membership_contrast={averaged_losses['membership_contrast']:.4f} "
+                        f"motif={averaged_losses['motif']:.4f} "
+                        f"community={averaged_losses['community']:.4f} "
+                        f"structure_align={averaged_losses['structure_align']:.4f} "
                         f"neg_hyperedges={averaged_stats['num_hyperedge_negatives']:.1f} "
                         f"neg_memberships={averaged_stats['num_membership_negatives']:.1f} "
                         f"avg_neg_overlap={averaged_stats['avg_negative_overlap']:.2f} "

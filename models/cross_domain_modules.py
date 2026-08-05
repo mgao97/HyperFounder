@@ -185,6 +185,229 @@ class CrossDomainFeatureProjectionModule(nn.Module):
         return projector(features, domain_id)
 
 
+class DomainAdapter(nn.Module):
+    """Domain-specific adapter for learning domain-biased deviations from shared structure."""
+
+    def __init__(self, hidden_dim: int, adapter_dim: int = 32):
+        super().__init__()
+        self.adapter_dim = adapter_dim
+        self.gate = nn.Sequential(
+            nn.Linear(hidden_dim, 1),
+            nn.Sigmoid(),
+        )
+        self.adapter_layer = nn.Sequential(
+            nn.Linear(hidden_dim, adapter_dim),
+            nn.ReLU(),
+            nn.Linear(adapter_dim, hidden_dim),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        gate_value = self.gate(x)
+        adapted = self.adapter_layer(x)
+        return gate_value * adapted
+
+
+class MoEExpert(nn.Module):
+    """Mixture of Experts routing expert - outputs hidden_dim directly."""
+
+    def __init__(self, hidden_dim: int, expert_dim: int = 32):
+        super().__init__()
+        self.expert_net = nn.Sequential(
+            nn.Linear(hidden_dim, expert_dim),
+            nn.ReLU(),
+            nn.Linear(expert_dim, hidden_dim),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.expert_net(x)
+
+
+class DomainMoE(nn.Module):
+    """Mixture of Experts for domain-specific adaptation."""
+
+    def __init__(self, hidden_dim: int, num_domains: int, expert_dim: int = 32, num_experts: int = 4):
+        super().__init__()
+        self.num_domains = num_domains
+        self.num_experts = num_experts
+        # Each expert maps hidden -> expert_dim -> hidden
+        self.experts = nn.ModuleList([
+            MoEExpert(hidden_dim, expert_dim) for _ in range(num_experts)
+        ])
+        self.router = nn.Sequential(
+            nn.Linear(hidden_dim, num_experts),
+        )
+
+    def forward(self, x: torch.Tensor, domain_id: int | None = None) -> torch.Tensor:
+        if x.numel() == 0:
+            return x
+        if x.dim() == 1:
+            x = x.unsqueeze(0)
+        
+        # Get routing weights
+        routing_logits = self.router(x)  # (batch, num_experts)
+        routing_weights = F.softmax(routing_logits, dim=-1)  # (batch, num_experts)
+        
+        # Stack expert outputs: (num_experts, batch, hidden)
+        expert_outputs = torch.stack([expert(x) for expert in self.experts], dim=0)
+        
+        # Weighted sum: (batch, num_experts) @ (num_experts, batch, hidden) -> (batch, hidden)
+        # routing_weights: (batch, num_experts) -> (batch, num_experts, 1)
+        # expert_outputs: (num_experts, batch, hidden) -> (batch, num_experts, hidden) after transpose
+        routing_weights_expanded = routing_weights.unsqueeze(-1)  # (batch, num_experts, 1)
+        expert_outputs_transposed = expert_outputs.transpose(0, 1)  # (batch, num_experts, hidden)
+        
+        adapted = (routing_weights_expanded * expert_outputs_transposed).sum(dim=1)  # (batch, hidden)
+        
+        if adapted.size(0) == 1:
+            adapted = adapted.squeeze(0)
+        
+        return adapted
+
+
+class DynamicDomainAdapter(nn.Module):
+    """
+    Unified dynamic domain adapter supporting both Adapter and MoE modes.
+    Composes shared features with domain-specific adaptations.
+    """
+
+    def __init__(
+        self,
+        hidden_dim: int,
+        num_domains: int,
+        adapter_type: str = "adapter",
+        adapter_dim: int = 32,
+        num_experts: int = 4,
+    ):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.num_domains = num_domains
+        self.adapter_type = adapter_type
+
+        if adapter_type == "adapter":
+            self.domain_adapters = nn.ModuleDict({
+                str(d): DomainAdapter(hidden_dim, adapter_dim) for d in range(num_domains)
+            })
+        elif adapter_type == "moe":
+            self.domain_moe = DomainMoE(hidden_dim, num_domains, adapter_dim, num_experts)
+        else:
+            self.domain_adapters = nn.ModuleDict()
+            self.domain_moe = None
+
+    def forward(self, shared_emb: torch.Tensor, domain_id: int) -> torch.Tensor:
+        if shared_emb.numel() == 0:
+            return shared_emb
+
+        if self.adapter_type == "adapter":
+            key = str(domain_id)
+            if key not in self.domain_adapters:
+                key = "0"
+            adapter_output = self.domain_adapters[key](shared_emb)
+        elif self.adapter_type == "moe":
+            adapter_output = self.domain_moe(shared_emb, domain_id)
+        else:
+            adapter_output = shared_emb.new_zeros_like(shared_emb)
+
+        return adapter_output
+
+
+class StructureAwareAlignment(nn.Module):
+    """
+    Multi-granularity structure alignment module.
+    Aligns node, edge, and subgraph structures across domains.
+    """
+
+    def __init__(self, hidden_dim: int, alignment_type: str = "prototype"):
+        super().__init__()
+        self.alignment_type = alignment_type
+        self.hidden_dim = hidden_dim
+
+        self.structure_encoder = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+
+        if alignment_type == "prototype":
+            self.prototype_projector = nn.Linear(hidden_dim, hidden_dim)
+        elif alignment_type == "ot":
+            self.ot_cost_projector = nn.Sequential(
+                nn.Linear(hidden_dim * 2, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, 1),
+            )
+
+    def compute_structure_features(
+        self,
+        node_emb: torch.Tensor,
+        edge_emb: torch.Tensor,
+        incidence: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute structure-aware features from node/edge embeddings and incidence."""
+        if incidence.is_sparse:
+            dense_inc = incidence.to_dense()
+        else:
+            dense_inc = incidence
+
+        num_nodes = node_emb.size(0)
+        node_context = torch.zeros_like(node_emb)
+
+        for i in range(num_nodes):
+            incident_edges = dense_inc[i].nonzero(as_tuple=True)[0]
+            if incident_edges.numel() > 0:
+                node_context[i] = edge_emb[incident_edges].mean(dim=0)
+
+        combined = torch.cat([node_emb, node_context], dim=-1)
+        return self.structure_encoder(combined)
+
+    def prototype_alignment_loss(
+        self,
+        node_emb_1: torch.Tensor,
+        node_emb_2: torch.Tensor,
+        num_prototypes: int = 8,
+    ) -> torch.Tensor:
+        """Align structural prototypes across views."""
+        combined_1 = self.compute_structure_features(node_emb_1, node_emb_1, torch.zeros(1, 1))
+        combined_2 = self.compute_structure_features(node_emb_2, node_emb_2, torch.zeros(1, 1))
+
+        proj_1 = F.normalize(self.prototype_projector(combined_1), dim=-1)
+        proj_2 = F.normalize(self.prototype_projector(combined_2), dim=-1)
+
+        prototypes_1 = proj_1[:num_prototypes]
+        prototypes_2 = proj_2[:num_prototypes]
+
+        sim_matrix = prototypes_1 @ prototypes_2.T / 0.07
+        labels = torch.arange(num_prototypes, device=sim_matrix.device)
+
+        loss = F.cross_entropy(sim_matrix, labels)
+        return loss
+
+    def structural_alignment_loss(
+        self,
+        emb_1: torch.Tensor,
+        emb_2: torch.Tensor,
+        struct_weight: float = 0.5,
+    ) -> torch.Tensor:
+        """
+        General structural alignment loss with multi-granularity consistency.
+        """
+        emb_1_norm = F.normalize(emb_1, dim=-1)
+        emb_2_norm = F.normalize(emb_2, dim=-1)
+
+        alignment_loss = 2 - 2 * (emb_1_norm * emb_2_norm).sum(dim=-1).mean()
+
+        if struct_weight > 0:
+            structure_1 = self.compute_structure_features(
+                emb_1, emb_1, torch.zeros(1, 1, device=emb_1.device)
+            )
+            structure_2 = self.compute_structure_features(
+                emb_2, emb_2, torch.zeros(1, 1, device=emb_2.device)
+            )
+            structure_loss = 2 - 2 * (F.normalize(structure_1, dim=-1) * F.normalize(structure_2, dim=-1)).sum(dim=-1).mean()
+            return alignment_loss + struct_weight * structure_loss
+
+        return alignment_loss
+
+
 class ScalableSparseHyperedgeAttention(nn.Module):
     def __init__(self, hidden_dim: int, num_heads: int, topk: int, dropout: float):
         super().__init__()

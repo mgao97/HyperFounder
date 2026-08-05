@@ -1,0 +1,172 @@
+# Negative-sampling enhanced full pretraining configuration (v5 - Challenge 1 & 2)
+# Features:
+# Challenge 1: Shared-Private Disentanglement, Multi-granularity Alignment, Confidence Routing
+# Challenge 2: Quality-aware Task Routing, Hard Negative Bank, Subgraph Quality Scoring
+
+model:
+  input_dim: 128
+  hidden_dim: 128
+  dropout: 0.3
+  num_layers: 4
+  num_heads: 8
+  structure_pe_dim: 8
+  # Domain adapter settings
+  use_domain_adapter: true
+  adapter_type: adapter  # Options: adapter, moe, none
+  adapter_dim: 32
+  num_experts: 4  # Only used when adapter_type=moe
+
+training:
+  seed: 7
+  device: cuda  # Using GPU for faster training
+  epochs: 300
+  steps_per_epoch: 32
+  enabled_tasks:
+    - masked_node
+    - hyperedge_recon
+    - contrastive
+    - size_pred
+    - domain_align
+    - membership_contrast
+    - motif
+    - community
+    - structure_align
+    - structure_discrimination  # Challenge 2: weak sample discrimination
+    - orth_node  # Challenge 1: Disentanglement orthogonality
+    - orth_edge
+    - private_domain_node  # Challenge 1: Private domain prediction
+    - private_domain_edge
+  log_step_history: true
+  log_interval_steps: 1
+  lr: 0.001
+  weight_decay: 0.0001
+  motif_budget: 32
+  feature_mask_rate: 0.15
+  edge_dropout_rate: 0.2
+  contrastive_strategy: node_dropping
+  contrastive_temperature: 0.1
+  min_masked_nodes: 4
+  # Task routing settings
+  use_task_routing: false
+  # Motif and community settings
+  num_motif_types: 8
+  num_prototypes: 8
+  output_dir: outputs_neg_sam_v2
+  early_stopping:
+    patience: 80
+  progress:
+    show_epoch_bar: true
+    show_step_bar: true
+    show_pool_bar: true
+    leave_progress_bar: false
+    mininterval_sec: 2.0
+  minibatch:
+    domains_per_step: 2
+    subhypergraphs_per_domain: 2
+    max_nodes: 256
+    max_edges: 128
+    expansion_hops: 2
+    seed_edges_per_subhypergraph: 1
+    use_subhypergraph_pool: true
+    subhypergraph_pool_size: 512
+    large_graph_node_threshold: 5000
+  
+  # === Challenge 1: Cross-Domain Disentanglement & Alignment ===
+  # Shared-Private Disentanglement
+  use_disentanglement: true
+  shared_dim: 128  # Dimension for shared representations
+  private_dim: 128  # Dimension for private representations
+  
+  # Multi-granularity Alignment
+  use_domain_alignment: true
+  use_node_alignment: true
+  use_edge_alignment: true
+  alignment_proj_dim: 64
+  node_num_prototypes: 32
+  edge_num_prototypes: 32
+  
+  # Confidence-based Selective Routing
+  use_confidence_routing: true
+  tau_node_align: 0.6  # Node confidence threshold for alignment
+  tau_edge_align: 0.65  # Edge confidence threshold for alignment
+  tau_neg_low: 0.4  # Low threshold for negative samples
+  
+  # === Challenge 2: Quality-aware Task Routing ===
+  # Subgraph quality scoring
+  use_quality_routing: true  # Enable quality-based task routing
+  quality_min_nodes: 4  # Minimum nodes for valid subgraph
+  quality_min_edges: 2  # Minimum edges for valid subgraph
+  
+  # Task routing thresholds
+  tau_hyperedge: 0.55  # Quality >= tau_hyperedge -> hyperedge_recon, contrastive
+  tau_motif: 0.70  # Quality >= tau_motif -> motif, community, structure_discrimination
+  tau_membership: 0.40  # Quality >= tau_membership -> membership
+  tau_hard_negative: 0.40  # Quality < tau_hard_negative -> hard_negative_bank
+  min_membership_nodes: 2  # Minimum nodes for membership task
+  
+  # Hard negative bank
+  use_hard_negative_bank: true
+  hard_negative_bank_size: 1000  # Maximum bank size
+  hard_negative_num_tiers: 3  # Number of quality tiers
+  hard_negative_sampling_strategy: quality_weighted  # random, quality_weighted, fifo
+  
+  # Log quality statistics
+  log_quality_stats: true
+  
+  loss_weights:
+    masked_node: 1.0
+    hyperedge_recon: 1.0
+    contrastive: 1.0
+    size_pred: 1.0
+    domain_align: 0.1
+    membership_contrast: 0.2
+    motif: 0.5
+    community: 0.5
+    structure_align: 0.3
+    structure_discrimination: 0.3  # Challenge 2: weak sample discrimination
+    # Challenge 1: Disentanglement losses
+    orth_node: 0.02  # Orthogonality loss for nodes
+    orth_edge: 0.02  # Orthogonality loss for edges
+    private_domain_node: 0.05  # Private domain prediction for nodes
+    private_domain_edge: 0.05  # Private domain prediction for edges
+
+neg_sampling:
+  hyperedge:
+    num_neg_per_pos: 2
+    modes: [replace, overlap, random]
+    min_negative_edge_size: 2
+    max_attempts: 10
+  membership:
+    num_neg_per_pos: 2
+    max_membership_hop: 3
+    min_nodes_for_node_contrastive: 8
+    min_edges_for_node_contrastive: 2
+  subgraph:
+    num_neg_per_pos: 2
+    min_overlap_density: 0.05
+    min_incidence_density: 0.05
+    min_component_ratio: 0.5
+
+data:
+  datasets:
+    - cora_cc
+    - citeseer_cc
+    - pubmed_cc
+    - coauthorship_dblp
+    - imdb_4k
+    - cooking_200
+    - gowalla
+    - yelp_2018
+  domain_map:
+    cora_cc: citation
+    citeseer_cc: citation
+    pubmed_cc: citation
+    coauthorship_dblp: academic
+    imdb_4k: academic
+    cooking_200: document
+    gowalla: recommendation
+    yelp_2018: recommendation
+  cache_dir: data/cache
+  splits:
+    train_ratio: 0.6
+    val_ratio: 0.2

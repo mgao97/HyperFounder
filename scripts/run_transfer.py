@@ -42,6 +42,8 @@ def main() -> None:
     else:
         raise ValueError(f"Unsupported task_name '{task_name}'.")
     summary = trainer.run(task_name=task_name, heldout_domain=args.heldout_domain)
+    # Record which checkpoint was used so compare_transfer_results.py can distinguish pretrained vs scratch
+    summary["pretrained_checkpoint"] = config["training"].get("pretrained_checkpoint")
     save_json(f"outputs/results/transfer_{task_name}_{args.heldout_domain}.json", summary)
     print(
         "[HyperFounder][Transfer] Finished:"

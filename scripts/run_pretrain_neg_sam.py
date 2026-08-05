@@ -28,7 +28,9 @@ def main() -> None:
     set_seed(int(config["training"]["seed"]))
     trainer = PretrainTrainerNegSam(config)
     summary = trainer.train()
-    save_json("outputs/results/pretrain_summary_neg_sam.json", summary)
+    # Save summary to the output_dir specified in config
+    output_dir = config.get("training", {}).get("output_dir", "outputs")
+    save_json(f"{output_dir}/results/pretrain_summary_neg_sam.json", summary)
     print(summary)
 
 
