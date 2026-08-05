@@ -206,7 +206,8 @@ class TAAMSG(nn.Module):
     def get_star_features(self, data):
         x = data.x
         num_hyperedges = data.hyperedge_index[1].max() + 1
-        s_init = torch.zeros(num_hyperedges, data.num_features).to(x.device)
+        feat_dim = x.size(1)
+        s_init = torch.zeros(num_hyperedges, feat_dim).to(x.device)
         x_star = torch.cat((x, s_init), 0)
         return x_star
     

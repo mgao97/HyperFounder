@@ -38,9 +38,15 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from utils.dhg_datasets import load_dhg_sample
 from utils.hypergraph import SimpleHypergraph
+from baselines.HNN.preprocessing import (
+    algo_preprocessing, generate_HNHN_norm, phenomNN_preprocessing, 
+    hjrl_preprocessing, legcn_preprocessing, dphgnn_preprocessing,
+    hypergt_preprocessing, ehnn_preprocessing, uni_expansion
+)
 
 # Check torch_sparse availability
 TORCH_SPARSE_AVAILABLE = False
+torch_sparse = None
 try:
     import torch_sparse
     TORCH_SPARSE_AVAILABLE = True
@@ -448,7 +454,7 @@ class ModelArgs:
             setattr(self, k, v)
 
 
-def create_model_wrapper(model_name: str, num_features: int, num_classes: int, params: Dict):
+def create_model_wrapper(model_name: str, num_features: int, num_classes: int, params: Dict, data=None):
     """Create a model wrapper based on model name."""
     
     # Check if model requires torch_geometric and if it's available
@@ -504,6 +510,8 @@ def create_model_wrapper(model_name: str, num_features: int, num_classes: int, p
                     'MLP_hidden': params['hidden'],
                     'mediator': False,
                     'HyperGCN_fast': True,
+                    'HyperGCN_mediators': False,
+                    'use_bn': False,
                 })
                 self.model = HyperGCNModel(num_features, num_classes, args)
                 
@@ -522,6 +530,13 @@ def create_model_wrapper(model_name: str, num_features: int, num_classes: int, p
                     'All_num_layers': params['layers'],
                     'dropout': params['dropout'],
                     'MLP_hidden': params['hidden'],
+                    'aggregate': params.get('aggregate', 'mean'),
+                    'normalization': params.get('normalization', 'bn'),
+                    'deepset_input_norm': params.get('AllSet_input_norm', True),
+                    'GPR': params.get('GPR', False),
+                    'LearnMask': params.get('LearnMask', False),
+                    'decoder_hidden': params.get('decoder_hidden', 128),
+                    'decoder_num_layers': params.get('decoder_num_layers', 1),
                 })
                 self.model = SetGNN(num_features, num_classes, args)
                 
@@ -533,6 +548,13 @@ def create_model_wrapper(model_name: str, num_features: int, num_classes: int, p
                     'MLP_hidden': params['hidden'],
                     'alpha': params.get('alpha', 0.5),
                     'beta': params.get('beta', 0.5),
+                    'method': 'UniGIN',
+                    'first_aggregate': params.get('first_aggregate', 'mean'),
+                    'use_norm': params.get('use_norm', False),
+                    'attn_drop': params.get('attn_drop', 0.0),
+                    'activation': params.get('activation', 'relu'),
+                    'input_drop': params.get('input_drop', 0.0),
+                    'uni_heads': params.get('uni_heads', 1),
                 })
                 self.model = UniGNN(num_features, num_classes, args)
                 
@@ -542,8 +564,27 @@ def create_model_wrapper(model_name: str, num_features: int, num_classes: int, p
                     'All_num_layers': params['layers'],
                     'dropout': params['dropout'],
                     'MLP_hidden': params['hidden'],
+                    'ehnn_hidden_channel': params.get('ehnn_hidden_channel', 64),
+                    'ehnn_inner_channel': params.get('ehnn_inner_channel', 64),
+                    'ehnn_type': params.get('ehnn_type', 'linear'),
+                    'ehnn_pe_dim': params.get('ehnn_pe_dim', 64),
+                    'ehnn_hyper_dim': params.get('ehnn_hyper_dim', 64),
+                    'ehnn_hyper_layers': params.get('ehnn_hyper_layers', 2),
+                    'ehnn_hyper_dropout': params.get('ehnn_hyper_dropout', 0.5),
+                    'ehnn_force_broadcast': params.get('ehnn_force_broadcast', 'True'),
+                    'ehnn_input_dropout': params.get('ehnn_input_dropout', 0.0),
+                    'ehnn_mlp_classifier': params.get('ehnn_mlp_classifier', 'True'),
+                    'ehnn_qk_channel': params.get('ehnn_qk_channel', 64),
+                    'ehnn_n_heads': params.get('ehnn_n_heads', 4),
+                    'ehnn_att0_dropout': params.get('ehnn_att0_dropout', 0.0),
+                    'ehnn_att1_dropout': params.get('ehnn_att1_dropout', 0.0),
+                    'decoder_hidden': params.get('decoder_hidden', 128),
+                    'decoder_num_layers': params.get('decoder_num_layers', 1),
+                    'normalization': params.get('normalization', 'bn'),
                 })
-                self.model = EHNN(num_features, num_classes, args)
+                # data is passed in from run_single_experiment for EHNN
+                ehnn_cache = data.ehnn_cache if data is not None else None
+                self.model = EHNN(num_features, num_classes, args, ehnn_cache)
                 
             elif model_name == 'cegcn' or model_name == 'cegat':
                 from baselines.HNN.cegnn import CEGCN, CEGAT
@@ -566,6 +607,16 @@ def create_model_wrapper(model_name: str, num_features: int, num_classes: int, p
                     'All_num_layers': params['layers'],
                     'dropout': params['dropout'],
                     'MLP_hidden': params['hidden'],
+                    'stalk_dim': params.get('stalk_dim', 64),
+                    'init_hedge': params.get('init_hedge', 'avg'),
+                    'sheaf_normtype': params.get('sheaf_normtype', 'degree_norm'),
+                    'sheaf_act': params.get('sheaf_act', 'relu'),
+                    'sheaf_left_proj': params.get('sheaf_left_proj', True),
+                    'AllSet_input_norm': params.get('AllSet_input_norm', True),
+                    'device': params.get('device', 0),
+                    'task_type': 'node_cls',
+                    'dynamic_sheaf': params.get('dynamic_sheaf', True),
+                    'residual_sheaf': params.get('residual_sheaf', True),
                 })
                 self.model = SheafHyperGNN(num_features, num_classes, args)
                 
@@ -731,126 +782,45 @@ def set_seed(seed: int):
         torch.cuda.manual_seed(seed)
 
 
-def preprocess_data(data, model_name: str):
-    """Apply model-specific preprocessing to data."""
-    if model_name == 'hnhn':
-        hnhc_preprocessing(data)
-    elif model_name == 'hypergt':
-        # Prepare hypergraph incidence matrix H for HyperGT
-        _prepare_hypergt_data(data)
-    elif model_name == 'hjrl':
-        # Prepare HJRL required matrices
-        _prepare_hjrl_data(data)
-    elif model_name == 'phenomnn' or model_name == 'phenomnns':
-        # Prepare PhenomNN required matrices
-        _prepare_phenomnn_data(data)
-    return data
-
-
-def _prepare_hypergt_data(data):
-    """Prepare data for HyperGT model."""
-    import scipy.sparse as sp
+def preprocess_data(data, model_name: str, params: Dict = None):
+    """Apply model-specific preprocessing using DHG-Bench preprocessing functions."""
+    if params is None:
+        params = {}
+    # Create a mock args object with the required attributes
+    class PreprocessArgs:
+        def __init__(self):
+            self.method = model_name
+            self.device = torch.device('cpu')
+            self.dname = 'cora'
+            self.task_type = 'node_cls'
+            self.mediator = params.get('mediator', False)
+            self.chunk_size = params.get('chunk_size', 1000)
+            self.threshold = params.get('threshold', 0.0)
+            self.norm_type = params.get('norm_type', 0)
+            self.init_val = params.get('init_val', 1.0)
+            self.init_type = params.get('init_type', 1)
+            # HNHN specific
+            self.HNHN_alpha = params.get('alpha', params.get('HNHN_alpha', -1.5))
+            self.HNHN_beta = params.get('beta', params.get('HNHN_beta', -0.5))
+            # PhenomNN specific
+            self.lam0 = params.get('lam0', 10)
+            self.lam1 = params.get('lam1', 10)
+            # TMPHN specific
+            self.M = params.get('M', 32)
+            # HyperGCN specific
+            self.HyperGCN_fast = params.get('HyperGCN_fast', True)
+            self.HyperGCN_mediators = params.get('HyperGCN_mediators', False)
     
-    edge_index = data.edge_index
-    num_nodes = data.num_nodes
-    num_edges = edge_index[1].max().item() + 1
+    args = PreprocessArgs()
     
-    # Create incidence matrix H (num_nodes x num_edges)
-    row = edge_index[0].cpu().numpy()
-    col = edge_index[1].cpu().numpy()
-    values = np.ones(len(row))
-    H_coo = sp.coo_matrix((values, (row, col)), shape=(num_nodes, num_edges))
-    H = torch.sparse_coo_tensor(
-        indices=torch.from_numpy(np.vstack([H_coo.row, H_coo.col])),
-        values=torch.from_numpy(H_coo.data),
-        size=H_coo.shape
-    ).float()
-    
-    # Create adjacency list (adjs) from edge_index
-    # Convert edge_index to list of edges for each node
-    adjs = [edge_index]  # Use edge_index as adjacency
-    data.adjs = adjs
-    data.H = H.to(edge_index.device)
-    
-    return data
-
-
-def _prepare_hjrl_data(data):
-    """Prepare data for HJRL model."""
-    import scipy.sparse as sp
-    
-    edge_index = data.edge_index
-    num_nodes = data.num_nodes
-    num_edges = edge_index[1].max().item() + 1
-    
-    # Create incidence matrix H (num_nodes x num_edges)
-    row = edge_index[0].cpu().numpy()
-    col = edge_index[1].cpu().numpy()
-    values = np.ones(len(row))
-    H_coo = sp.coo_matrix((values, (row, col)), shape=(num_nodes, num_edges))
-    H = torch.from_numpy(H_coo.toarray()).float()
-    HT = H.t()
-    
-    # Compute HHT and HTH
-    HHT = torch.mm(H, HT)  # Node similarity (num_nodes x num_nodes)
-    HTH = torch.mm(HT, H)  # Hyperedge similarity (num_edges x num_edges)
-    
-    # Degree matrices for normalization
-    D_v = torch.diag(H.sum(dim=1))
-    D_e = torch.diag(H.sum(dim=0))
-    D_v_inv = torch.inverse(D_v + torch.eye(num_nodes) * 1e-10)
-    D_e_inv = torch.inverse(D_e + torch.eye(num_edges) * 1e-10)
-    
-    # norm_X is the normalized feature matrix (num_nodes x num_features)
-    # HJRL uses node features (data.x), not incidence matrix
-    norm_X = data.x  # Use original features
-    norm_E = data.x[:num_edges] if data.x.shape[0] >= num_edges else torch.zeros(num_edges, data.x.shape[1])
-    
-    data.norm_X = norm_X.to(edge_index.device)
-    data.norm_E = norm_E.to(edge_index.device)
-    data.HHT = HHT.to(edge_index.device)
-    data.H = H.to(edge_index.device)
-    data.HT = HT.to(edge_index.device)
-    data.HTH = HTH.to(edge_index.device)
-    
-    return data
-
-
-def _prepare_phenomnn_data(data):
-    """Prepare data for PhenomNN model."""
-    import scipy.sparse as sp
-    
-    edge_index = data.edge_index
-    num_nodes = data.num_nodes
-    num_edges = edge_index[1].max().item() + 1
-    
-    # Create incidence matrix H
-    row = edge_index[0].cpu().numpy()
-    col = edge_index[1].cpu().numpy()
-    values = np.ones(len(row))
-    H_coo = sp.coo_matrix((values, (row, col)), shape=(num_nodes, num_edges))
-    H = torch.from_numpy(H_coo.toarray()).float()
-    HT = H.t()
-    
-    # Compute adjacency matrices
-    # A_beta: node-to-node via hyperedges
-    HHT = torch.mm(H, HT)
-    HTH = torch.mm(HT, H)
-    
-    # D_beta for node normalization
-    D_beta = torch.diag(HHT.sum(dim=1))
-    I = torch.eye(num_nodes)
-    
-    # Normalized node adjacency
-    D_beta_inv_sqrt = torch.inverse(torch.sqrt(D_beta + torch.eye(num_nodes) * 1e-10))
-    A_beta = torch.mm(torch.mm(D_beta_inv_sqrt, HHT), D_beta_inv_sqrt)
-    
-    # PhenomNN uses A_beta for both adj entries (simplified version)
-    # and D_beta for both D_beta and D_gamma in G
-    data.adj = [A_beta, A_beta]  # Simplified: use same adj
-    data.G = [D_beta, D_beta, I]
-    data.adj = [a.to(edge_index.device) for a in data.adj]
-    data.G = [g.to(edge_index.device) for g in data.G]
+    # Use DHG-Bench preprocessing
+    if model_name.lower() == 'ehnn':
+        # EHNN requires special preprocessing with cache
+        from baselines.HNN.preprocessing import ehnn_preprocessing
+        cache_path = os.path.join('.', 'lib_ehnn_cache', f'{args.dname}.pt')
+        data = ehnn_preprocessing(data, args, cache_path=cache_path)
+    else:
+        data = algo_preprocessing(data, args)
     
     return data
 
@@ -886,10 +856,15 @@ def evaluate(model, data):
 def run_single_experiment(model_name: str, data, num_classes, params, max_epochs, patience, seed):
     set_seed(seed)
     
-    data = preprocess_data(data, model_name)
+    # Preprocess data first to get ehnn_cache for EHNN
+    data = preprocess_data(data, model_name, params)
     num_features = data.x.size(1)
     
-    model = create_model_wrapper(model_name, num_features, num_classes, params)
+    # For EHNN, we need to pass ehnn_cache to the model
+    if model_name.lower() == 'ehnn':
+        model = create_model_wrapper(model_name, num_features, num_classes, params, data)
+    else:
+        model = create_model_wrapper(model_name, num_features, num_classes, params)
     
     optimizer = torch.optim.AdamW(model.parameters(), lr=params['lr'], weight_decay=params.get('wd', 0.0))
     
@@ -1054,8 +1029,8 @@ def main():
         # Only run newly implemented models that don't require torch_geometric
         models = ['dphgnn', 'hypergt', 'edhnn', 'hjrl', 'tfhnn', 'phenomnn', 'phenomnns', 'hypernd', 'unigcnii']
     elif args.model == 'available':
-        # Only run models that should work in current environment
-        models = ['dphgnn', 'hypergt', 'edhnn', 'hjrl', 'tfhnn', 'phenomnn', 'phenomnns', 'hypernd']
+        # Only run models that work in current environment
+        models = ['tfhnn', 'edhnn']
     else:
         models = [args.model]
     

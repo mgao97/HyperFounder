@@ -20,30 +20,31 @@ import os
 from torch_geometric.utils import remove_self_loops
 
 def algo_preprocessing(data,args,ehnn_cache_path=None):
+    method = args.method.lower() if hasattr(args.method, 'lower') else str(args.method).lower()
 
-    if args.method =='LEGCN':
+    if method == 'legcn':
         data = legcn_preprocessing(data,args)  # line_expansion
-    elif args.method in ['HNHN']:
+    elif method in ['hnhn']:
         data = generate_HNHN_norm(data,args)
-    elif args.method in ['PhenomNNS','PhenomNN']:
+    elif method in ['phennomnn', 'phennomnns', 'phennomnn']:
         data = phenomNN_preprocessing(data,args)
-    elif args.method == 'HJRL':
+    elif method == 'hjrl':
         data = hjrl_preprocessing(data,args)
-    elif args.method == 'TMPHN':
+    elif method == 'tmphn':
         data = tmphn_preprocessing(data,args) 
-    elif args.method == 'DPHGNN':
+    elif method == 'dphgnn':
         data = dphgnn_preprocessing(data,args) 
-    elif args.method == 'EHNN':
+    elif method == 'ehnn':
         data = ehnn_preprocessing(
             data,
             args,
             cache_path=ehnn_cache_path,
         )
-    elif args.method in ['PlainUnigencoder']:
+    elif method in ['plainunigencoder']:
         data =uni_expansion(data,args)
-    elif args.method == 'HyperGT':
+    elif method in ['hypergt', 'hypergt']:
         data = hypergt_preprocessing(data,args)
-    elif args.method in ['CEGCN','CEGAT']:
+    elif method in ['cegcn','cegat']:
         data = cegnn_preprocessing(data,args)
     else:
         pass
@@ -193,8 +194,11 @@ def clique_preprocessing(data,args):
 
 def hypergcn_preprocessing(data,args):
 
-    data_copy = copy.deepcopy(data)
-    data_copy.to('cpu')
+    class SimpleData:
+        pass
+    data_copy = SimpleData()
+    data_copy.hyperedge_index = data.hyperedge_index.detach().cpu().clone()
+    data_copy.x = data.x.detach().cpu().clone().numpy()
     He_dict = get_HyperGCN_He_dict(data_copy)
     A = hypergcn_expansion(V=data_copy.x.shape[0], E=He_dict, X=data_copy.x, m=args.mediator) 
     A_hyp = symnormalise(A) 
@@ -352,7 +356,7 @@ def generate_HNHN_norm(data, args):
     :return: G
     """
 
-    edge_index=copy.deepcopy(data.hyperedge_index)
+    edge_index = data.hyperedge_index.detach().clone()
     edge_index = edge_index.to('cpu')
 
     # Construct incidence matrix H of size (num_nodes, num_hyperedges) from edge_index = [V;E]
@@ -592,7 +596,7 @@ def legcn_preprocessing(data,args):
     return data
 
 def line_expansion(data,args):
-    hyperedge_index=copy.deepcopy(data.hyperedge_index)
+    hyperedge_index = data.hyperedge_index.detach().clone()
     hyperedge_index = hyperedge_index.to('cpu')
     V, E = hyperedge_index
     num_nodes = int(data.num_nodes)
@@ -613,7 +617,7 @@ def line_expansion(data,args):
 
 def hjrl_preprocessing(data,args):
     
-    hyperedge_index=copy.deepcopy(data.hyperedge_index)
+    hyperedge_index = data.hyperedge_index.detach().clone()
     hyperedge_index = hyperedge_index.to('cpu')
 
     row = hyperedge_index[0].numpy()  
@@ -660,7 +664,7 @@ def normalize_sparse_hypergraph_symmetric(H):
 
 def precompute_node_edge_features(H_ini,X,device):
 
-    X = copy.deepcopy(X)
+    X = X.detach().clone()
     X = X.cpu()
     E_node = H_ini.toarray().shape[1]
     H_T = H_ini.toarray().T
@@ -736,7 +740,7 @@ def update(Se, Ie, mediator, weights, c):
 
 def tmphn_preprocessing(data,args):
 
-    hyperedge_index=copy.deepcopy(data.hyperedge_index)
+    hyperedge_index = data.hyperedge_index.detach().clone()
     hyperedge_index = hyperedge_index.to('cpu')
 
     row = hyperedge_index[0].numpy()  
@@ -846,12 +850,13 @@ def ehnn_preprocessing(
         folder='lib_ehnn_cache',
         cache_path=None):
     
-    src_data = copy.deepcopy(data)
+    src_data = data
+    orig_hyperedge_index = data.hyperedge_index.detach().clone()
     data = data.to('cpu')
     
     # build memory-efficiently for yelp and walmart-trips-100
     if args.dname not in ["yelp", "walmart-trips-100"]:
-        original_edge_index = data.hyperedge_index
+        original_edge_index = data.hyperedge_index.detach().clone()
         data = ConstructH(data)  # [|V|, |E|]
         incidence_d = (
             torch.tensor(data.hyperedge_index, dtype=torch.float32)
@@ -956,6 +961,7 @@ def ehnn_preprocessing(
         )
     print(f"number of mask channels: {ehnn_cache['n_overlaps']}")
     
+    src_data.hyperedge_index = orig_hyperedge_index
     src_data.ehnn_cache = ehnn_cache
     
     return src_data

@@ -2,9 +2,9 @@ import ast
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from baselines.HNN.mlp import MLP
-from baselines.HNN.ehnn_linear import EHNNLinearConv
-from baselines.HNN.ehnn_transformer import EHNNTransformerConv
+from .mlp import MLP
+from .ehnn_linear import EHNNLinearConv
+from .ehnn_transformer import EHNNTransformerConv
 
 class EHNN(nn.Module):
     

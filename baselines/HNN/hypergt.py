@@ -145,16 +145,24 @@ class HyperGT(nn.Module):
         z = self.fcs[0](x)
        
         if 'HEPE' in self.args.pe:
-            he_pe = self.he_sparse_encoder(H).unsqueeze(0)
-            padding = torch.zeros(z.shape[0], z.shape[1] - he_pe.shape[1], z.shape[2],
-                                 requires_grad=False, device=z.device)
-            he_pe = torch.cat((he_pe, padding), dim=1)
+            he_pe = self.he_sparse_encoder(H).unsqueeze(0)  # [1, n, hidden]
+            # Ensure pe matches z's sequence dimension
+            if he_pe.shape[1] < z.shape[1]:
+                padding = torch.zeros(z.shape[0], z.shape[1] - he_pe.shape[1], z.shape[2],
+                                     requires_grad=False, device=z.device)
+                he_pe = torch.cat((he_pe, padding), dim=1)
+            elif he_pe.shape[1] > z.shape[1]:
+                he_pe = he_pe[:, :z.shape[1], :]
             z = z + he_pe
         if 'HtEPE' in self.args.pe:
-            hte_pe = self.hte_sparse_encoder(H.transpose(0, 1)).unsqueeze(0)
-            padding = torch.zeros(z.shape[0], z.shape[1] - hte_pe.shape[1], z.shape[2],
-                                 requires_grad=False, device=z.device)
-            hte_pe = torch.cat((padding, hte_pe), dim=1)
+            hte_pe = self.hte_sparse_encoder(H.transpose(0, 1)).unsqueeze(0)  # [1, m, hidden]
+            # Ensure pe matches z's sequence dimension
+            if hte_pe.shape[1] < z.shape[1]:
+                padding = torch.zeros(z.shape[0], z.shape[1] - hte_pe.shape[1], z.shape[2],
+                                     requires_grad=False, device=z.device)
+                hte_pe = torch.cat((padding, hte_pe), dim=1)
+            elif hte_pe.shape[1] > z.shape[1]:
+                hte_pe = hte_pe[:, :z.shape[1], :]
             z = z + hte_pe
         
         if self.use_bn:

@@ -84,8 +84,11 @@ class HyperGCN(nn.Module):
         """
         if self.structure is None:
             print('Precomputing ...')
-            data_copy = copy.deepcopy(data)
-            data_copy.to('cpu')
+            class SimpleData:
+                pass
+            data_copy = SimpleData()
+            data_copy.hyperedge_index = data.hyperedge_index.detach().cpu().clone()
+            data_copy.x = data.x.detach().cpu().clone().numpy()
             He_dict = get_HyperGCN_He_dict(data_copy) 
             
             if self.fast:
