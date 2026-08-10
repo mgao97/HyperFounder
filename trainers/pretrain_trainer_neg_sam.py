@@ -184,7 +184,10 @@ class PretrainTrainerNegSam(TrainerBase):
                 if key == "stats":
                     continue  # Skip stats, handle separately
                 if isinstance(value, torch.Tensor):
-                    value = value.item()
+                    if value.numel() == 1:
+                        value = value.item()
+                    else:
+                        value = value.mean().item()
                 if isinstance(value, (int, float)):
                     aggregated[key] = aggregated.get(key, 0.0) + float(value)
         # Average by batch size
