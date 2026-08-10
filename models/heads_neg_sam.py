@@ -365,11 +365,17 @@ class TaskHeadsNegSam(nn.Module):
         losses["orth_node"] = node_losses["orth"]
         losses["private_domain_node"] = node_losses["private_domain"]
 
-        # Edge disentanglement: use edge_domain_labels if provided, otherwise tile/repeat
+        # Edge disentanglement: use edge_domain_labels if provided, otherwise repeat to match.
         if edge_domain_labels is None:
-            # Tile domain labels to match edge batch size
             num_edges = z_edge_shared.size(0)
-            edge_domain_labels = domain_labels[:num_edges].clone()
+            if num_edges == 0:
+                edge_domain_labels = domain_labels[:0]
+            elif domain_labels.numel() == 0:
+                edge_domain_labels = torch.zeros((num_edges,), dtype=torch.long, device=domain_labels.device)
+            else:
+                # Repeat domain_labels to cover all edges (handles num_edges > num_nodes too).
+                repeats = (num_edges + domain_labels.numel() - 1) // domain_labels.numel()
+                edge_domain_labels = domain_labels.repeat(repeats)[:num_edges]
         
         edge_losses = self.disentanglement_losses(
             z_edge_shared,
@@ -422,8 +428,12 @@ class TaskHeadsNegSam(nn.Module):
             edge_align_mask=edge_align_mask,
         )
 
+        # Only keep scalar (loss) tensors; metadata like proto_ids would otherwise
+        # leak multi-element tensors into the loss dict and break .item() later.
         for key, val in align_losses.items():
             if isinstance(val, torch.Tensor):
+                if val.numel() != 1:
+                    continue  # metadata, not a loss
                 losses[f"align_{key}"] = val * self.lambda_align
             else:
                 losses[key] = val

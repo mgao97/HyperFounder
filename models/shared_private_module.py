@@ -253,9 +253,13 @@ class DisentanglementLosses(nn.Module):
         losses["orth"] = self.orth_loss(z_shared, z_private)
 
         # Private domain prediction loss (encourages private to retain domain info)
-        if self.lambda_private_domain > 0 and domain_labels is not None:
+        if self.lambda_private_domain > 0 and domain_labels is not None and domain_labels.numel() > 0:
             domain_logits = private_predictor(z_private)
-            losses["private_domain"] = F.cross_entropy(domain_logits, domain_labels.long())
+            if domain_logits.size(0) == domain_labels.size(0):
+                losses["private_domain"] = F.cross_entropy(domain_logits, domain_labels.long())
+            else:
+                # Size mismatch (e.g. single-edge subhypergraph); skip rather than crash.
+                losses["private_domain"] = z_shared.new_tensor(0.0)
         else:
             losses["private_domain"] = z_shared.new_tensor(0.0)
 
