@@ -62,75 +62,91 @@ def compute_subhypergraph_quality(
     """
     Compute quality score and metadata for a sampled sub-hypergraph.
     
-    Returns:
-        SubhypergraphMeta with quality score and routing decision
+    Optimized: collapse all .item() calls into a single CPU sync.
     """
     num_nodes = hg.num_nodes
     num_edges = len(hg.hyperedges)
+    if num_edges == 0 or num_nodes == 0:
+        # Fast path for degenerate graphs - avoid any GPU work.
+        return SubhypergraphMeta(
+            num_nodes=num_nodes,
+            num_edges=num_edges,
+            incidence_nnz=0,
+            component_ratio=0.0,
+            overlap_density=0.0,
+            cardinality_mean=0.0,
+            cardinality_std=0.0,
+            validity_flag=False,
+            quality_score=0.0,
+            routing=_get_task_routing_decision(
+                quality_score=0.0, validity_flag=False, num_nodes=num_nodes,
+                tau_hyperedge=tau_hyperedge, tau_motif=tau_motif,
+                tau_membership=tau_membership, tau_hard_negative=tau_hard_negative,
+            ),
+            domain_id=domain_id,
+            parent_graph_name=hg.name,
+        )
     
-    # Compute incidence statistics
     incidence = hg.incidence_matrix()
-    if incidence.is_sparse:
-        dense_inc = incidence.to_dense()
+    dense_inc = incidence.to_dense() if incidence.is_sparse else incidence
+    inc_bool = dense_inc > 0  # (N, E) bool
+    edge_card = inc_bool.sum(dim=0).float()  # (E,)
+    
+    # All statistics as tensors until a single sync at the end.
+    incidence_nnz_t = inc_bool.sum()
+    nodes_with_edges_t = (edge_card > 0).sum()
+    
+    overlap_density = 0.0
+    if num_edges >= 2:
+        # Boolean matmul: overlap_matrix[i,j] = number of shared nodes.
+        overlap_matrix = dense_inc.transpose(0, 1) @ dense_inc
+        # Use the upper-triangular off-diagonal mean to avoid the explicit triu_indices call.
+        ones = torch.ones_like(overlap_matrix)
+        mask = torch.triu(ones, diagonal=1)
+        edge_overlaps_sum = (overlap_matrix * mask).sum()
+        pair_count = max(num_edges * (num_edges - 1) // 2, 1)
+        overlap_density_t = edge_overlaps_sum / pair_count
+        overlap_density_norm_t = overlap_density_t / max(num_nodes, 1)
     else:
-        dense_inc = incidence
+        overlap_density_norm_t = torch.tensor(0.0, device=dense_inc.device)
     
-    incidence_nnz = int((dense_inc > 0).sum().item())
+    cardinality_mean_t = edge_card.mean() if edge_card.numel() > 0 else torch.tensor(0.0, device=edge_card.device)
+    cardinality_std_t = edge_card.std() if edge_card.numel() > 1 else torch.tensor(0.0, device=edge_card.device)
     
-    # Validity check
+    # SINGLE CPU sync to read all scalars.
+    stats = torch.stack([
+        incidence_nnz_t.float(),
+        nodes_with_edges_t.float(),
+        overlap_density_norm_t.float() if isinstance(overlap_density_norm_t, torch.Tensor) else torch.tensor(float(overlap_density_norm_t)),
+        cardinality_mean_t,
+        cardinality_std_t,
+    ]).cpu().tolist()
+    incidence_nnz, nodes_with_edges, overlap_density, cardinality_mean, cardinality_std = stats
+    overlap_density = min(float(overlap_density), 1.0)
+    
+    component_ratio = nodes_with_edges / num_nodes
     validity_flag = (
         num_nodes >= min_nodes
         and num_edges >= min_edges
         and incidence_nnz > 0
     )
-    
-    # Component ratio
-    if num_nodes > 0 and num_edges > 0:
-        nodes_with_edges = (dense_inc.sum(dim=1) > 0).sum().item()
-        component_ratio = nodes_with_edges / num_nodes
-    else:
-        component_ratio = 0.0
-    
-    # Overlap density - optimized with batch matrix multiplication
-    # O(n²) → O(n² / w) where w is hardware width
-    overlap_density = 0.0
-    if num_edges >= 2:
-        # Compute all pairwise overlaps efficiently using matrix multiplication
-        # overlap_matrix[i,j] = number of shared nodes between edge i and edge j
-        overlap_matrix = dense_inc.T @ dense_inc  # (num_edges, num_edges)
-        # Get upper triangular part (excluding diagonal) for average
-        triu_indices = torch.triu_indices(num_edges, num_edges, offset=1, device=overlap_matrix.device)
-        edge_overlaps = overlap_matrix[triu_indices[0], triu_indices[1]].float()
-        if edge_overlaps.numel() > 0:
-            overlap_density = edge_overlaps.mean().item()
-            overlap_density = min(overlap_density / max(num_nodes, 1), 1.0)
-    
-    # Cardinality statistics
-    cardinalities = dense_inc.sum(dim=0)
-    cardinality_mean = cardinalities.float().mean().item() if cardinalities.numel() > 0 else 0.0
-    cardinality_std = cardinalities.float().std().item() if cardinalities.numel() > 1 else 0.0
-    
-    # Compute quality score
     quality_score = _compute_quality_score(
-        validity_flag=validity_flag,
+        validity_flag=bool(validity_flag),
         num_nodes=num_nodes,
         num_edges=num_edges,
         component_ratio=component_ratio,
         overlap_density=overlap_density,
-        incidence_nnz=incidence_nnz,
+        incidence_nnz=int(incidence_nnz),
     )
-    
-    # Compute routing decision
     routing = _get_task_routing_decision(
         quality_score=quality_score,
-        validity_flag=validity_flag,
+        validity_flag=bool(validity_flag),
         num_nodes=num_nodes,
         tau_hyperedge=tau_hyperedge,
         tau_motif=tau_motif,
         tau_membership=tau_membership,
         tau_hard_negative=tau_hard_negative,
     )
-    
     return SubhypergraphMeta(
         num_nodes=num_nodes,
         num_edges=num_edges,

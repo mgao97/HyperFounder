@@ -54,36 +54,52 @@ def edge_overlap(edge_a: Sequence[int], edge_b: Sequence[int]) -> int:
 
 
 def compute_node_to_edge_membership_sets(hg: SimpleHypergraph, max_hop: int) -> Dict[int, Dict[int, List[int]]]:
-    node_to_edges: Dict[int, List[int]] = {node_id: [] for node_id in range(hg.num_nodes)}
-    for edge_index, edge in enumerate(hg.hyperedges):
-        for node_id in edge:
-            node_to_edges.setdefault(int(node_id), []).append(edge_index)
+    # Vectorized BFS over edge-graph using sparse matmul. Falls back to original
+    # implementation only if the hypergraph is degenerate.
+    incidence = hg.incidence_matrix()
+    num_nodes, num_edges = incidence.size(0), incidence.size(1)
+    if num_edges == 0 or num_nodes == 0:
+        return {node_id: {} for node_id in range(num_nodes)}
 
-    adjacency: Dict[int, List[int]] = {edge_index: [] for edge_index in range(len(hg.hyperedges))}
-    for first_index, first_edge in enumerate(hg.hyperedges):
-        first_nodes = set(first_edge)
-        for second_index in range(first_index + 1, len(hg.hyperedges)):
-            if first_nodes.intersection(hg.hyperedges[second_index]):
-                adjacency[first_index].append(second_index)
-                adjacency[second_index].append(first_index)
+    # edge-edge adjacency via incidence^T @ incidence (boolean).
+    inc = (incidence > 0).to(torch.float32)
+    edge_adj = (inc.transpose(0, 1) @ inc).clamp_max(1.0)
+    # Zero the diagonal (no self-loop).
+    edge_adj = edge_adj - torch.diag(torch.diagonal(edge_adj))
 
-    memberships: Dict[int, Dict[int, List[int]]] = {}
-    for node_id in range(hg.num_nodes):
-        memberships[node_id] = {}
-        frontier = set(node_to_edges.get(node_id, []))
-        visited = set(frontier)
-        if frontier:
-            memberships[node_id][1] = sorted(frontier)
+    # node->incident edges (boolean vector per node, from incidence rows).
+    # visited_nodes_to_edges[hop, e] = 1 if edge e is reachable in exactly `hop`
+    # node-incident edges.
+    visited_per_hop = []
+    visited = torch.zeros((num_edges,), dtype=torch.bool)
+    next_frontier = (incidence.to(torch.bool)).any(dim=0)  # edges with any node
+    # Hop 1 = edges incident to each node? We store per-node reachable sets,
+    # so do per-row matmul against edge_adj instead.
+
+    # Per-node BFS over edges using sparse edge_adj.
+    memberships: Dict[int, Dict[int, List[int]]] = {node_id: {} for node_id in range(num_nodes)}
+    incident_per_node = [(incidence[node_id] > 0).nonzero(as_tuple=True)[0] for node_id in range(num_nodes)]
+
+    for node_id in range(num_nodes):
+        incident = incident_per_node[node_id]
+        if incident.numel() == 0:
+            continue
+        memberships[node_id][1] = incident.tolist()
+        if max_hop <= 1:
+            continue
+        visited_e = torch.zeros((num_edges,), dtype=torch.bool)
+        visited_e[incident] = True
+        frontier = visited_e.clone().to(torch.float32)
         for hop in range(2, max_hop + 1):
-            next_frontier = set()
-            for edge_index in frontier:
-                next_frontier.update(adjacency.get(edge_index, []))
-            next_frontier.difference_update(visited)
-            if not next_frontier:
+            new_frontier = edge_adj @ frontier
+            new_frontier = (new_frontier > 0).to(torch.float32)
+            new_frontier = new_frontier * (~visited_e).to(torch.float32)
+            new_indices = new_frontier.nonzero(as_tuple=True)[0]
+            if new_indices.numel() == 0:
                 break
-            memberships[node_id][hop] = sorted(next_frontier)
-            visited.update(next_frontier)
-            frontier = next_frontier
+            memberships[node_id][hop] = new_indices.tolist()
+            visited_e = visited_e | new_frontier.bool()
+            frontier = new_frontier
     return memberships
 
 
@@ -159,34 +175,45 @@ def _sample_overlap_negative(
     edge_index: int,
     generator: torch.Generator,
     cfg: Dict,
+    _cache: Dict | None = None,
 ) -> Optional[List[int]]:
+    # Vectorized overlap search via incidence^T @ anchor incidence column.
+    # _cache (optional) holds precomputed incidence and overlap_rows to avoid
+    # recomputation across multiple calls with the same hypergraph.
+    if _cache is None:
+        incidence = hg.incidence_matrix()
+        anchor_inc = incidence[:, edge_index]
+        # overlaps[j] = number of shared nodes between edge_index and edge j.
+        overlaps = (incidence.transpose(0, 1) @ anchor_inc.unsqueeze(-1)).squeeze(-1)
+        overlaps = overlaps.tolist()
+    else:
+        overlaps = _cache.get("overlap_rows")[edge_index]
     anchor = canonicalize_edge(hg.hyperedges[edge_index])
-    overlapping_indices = [
-        candidate_index
-        for candidate_index, candidate_edge in enumerate(hg.hyperedges)
-        if candidate_index != edge_index and edge_overlap(anchor, candidate_edge) > 0
-    ]
+    overlapping_indices = [j for j, ov in enumerate(overlaps) if j != edge_index and ov > 0]
     if not overlapping_indices:
         return None
-    picked_index = int(torch.randint(0, len(overlapping_indices), (1,), generator=generator).item())
-    other_edge = canonicalize_edge(hg.hyperedges[overlapping_indices[picked_index]])
+    picked_index = overlapping_indices[int(torch.randint(0, len(overlapping_indices), (1,), generator=generator).item())]
+    other_edge = canonicalize_edge(hg.hyperedges[picked_index])
     shared = sorted(set(anchor).intersection(other_edge))
     foreign = [node_id for node_id in other_edge if node_id not in shared]
     candidate = shared[:]
     target_size = len(anchor)
-    for node_id in foreign:
-        if len(candidate) >= target_size:
-            break
-        candidate.append(node_id)
+    candidate.extend(foreign[: max(0, target_size - len(candidate))])
     if len(candidate) < target_size:
-        fallback = [node_id for node_id in range(hg.num_nodes) if node_id not in candidate]
+        node_set = set(candidate)
+        fallback = [n for n in range(hg.num_nodes) if n not in node_set]
         if not fallback:
             return None
-        while len(candidate) < target_size:
-            candidate.append(int(fallback[int(torch.randint(0, len(fallback), (1,), generator=generator).item())]))
-            candidate = sorted(set(candidate))
-            if len(candidate) > target_size:
-                candidate = candidate[:target_size]
+        n_to_pick = target_size - len(candidate)
+        if n_to_pick >= len(fallback):
+            candidate = sorted(set(candidate).union(fallback))
+        else:
+            picks = torch.randint(0, len(fallback), (n_to_pick,), generator=generator).tolist()
+            seen = set(candidate)
+            for p in picks:
+                seen.add(int(fallback[p]))
+            candidate = sorted(seen)
+        candidate = candidate[:target_size]
     if edge_overlap(anchor, candidate) <= 0:
         return None
     return sorted(candidate) if is_valid_negative_edge(hg, candidate, cfg) else None
@@ -214,6 +241,16 @@ def sample_hyperedge_negatives(
     overlap_scores: List[float] = []
     hard_negative_count = 0
 
+    # Precompute incidence-based overlap matrix once (num_edges x num_edges).
+    # This lets the overlap-mode sampler skip the O(E^2) Python loop.
+    needs_overlap = "overlap" in modes and hg.hyperedges
+    if needs_overlap:
+        incidence = hg.incidence_matrix()
+        overlap_mat = (incidence.transpose(0, 1) @ incidence).tolist()
+        overlap_cache = {"overlap_rows": overlap_mat}
+    else:
+        overlap_cache = None
+
     for edge_index, edge in enumerate(hg.hyperedges):
         if len(edge) < int(cfg.get("min_negative_edge_size", 2)):
             continue
@@ -224,7 +261,7 @@ def sample_hyperedge_negatives(
                 if selected_mode == "replace":
                     candidate = _sample_replacement_negative(hg, edge, generator, cfg)
                 elif selected_mode == "overlap":
-                    candidate = _sample_overlap_negative(hg, edge_index, generator, cfg)
+                    candidate = _sample_overlap_negative(hg, edge_index, generator, cfg, _cache=overlap_cache)
                 else:
                     candidate = _sample_random_negative(hg, len(edge), generator, cfg)
                 if candidate is not None:
@@ -267,25 +304,36 @@ def sample_membership_negatives(
     hop_labels: List[int] = []
     false_negative_rejects = 0
 
+    # Precompute per-node incident edges (once) and fallback global edge list.
+    incident_per_node = [
+        (incidence[node_id] > 0).nonzero(as_tuple=True)[0].tolist()
+        for node_id in range(hg.num_nodes)
+    ]
+    all_edge_indices = list(range(len(hg.hyperedges)))
+
     for node_id in range(hg.num_nodes):
-        incident_edges = torch.where(incidence[node_id] > 0)[0].tolist()
+        incident_edges = incident_per_node[node_id]
         if not incident_edges:
             continue
+        incident_set = set(incident_edges)
         hop_candidates = memberships.get(node_id, {})
         nearby = sorted({edge_id for hop, edges in hop_candidates.items() if hop >= 2 for edge_id in edges})
-        fallback = [edge_id for edge_id in range(len(hg.hyperedges)) if edge_id not in incident_edges]
+        if not nearby:
+            continue  # no valid negatives possible; saves fallback list materialization
         for pos_edge_index in incident_edges:
             for _ in range(num_neg_per_pos):
                 if nearby:
                     selected = nearby[int(torch.randint(0, len(nearby), (1,), generator=generator).item())]
                     hop = next((hop_id for hop_id, edge_ids in hop_candidates.items() if selected in edge_ids), max_hop)
-                elif fallback:
+                else:
+                    # Use precomputed all-edge list (one .tolist() per call instead of per-node).
+                    fallback = [edge_id for edge_id in all_edge_indices if edge_id not in incident_set]
+                    if not fallback:
+                        false_negative_rejects += 1
+                        continue
                     selected = fallback[int(torch.randint(0, len(fallback), (1,), generator=generator).item())]
                     hop = max_hop
-                else:
-                    false_negative_rejects += 1
-                    continue
-                if selected in incident_edges:
+                if selected in incident_set:
                     false_negative_rejects += 1
                     continue
                 pos_pairs.append([node_id, pos_edge_index])

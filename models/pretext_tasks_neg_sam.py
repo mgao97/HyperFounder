@@ -189,22 +189,31 @@ def compute_pretraining_losses(
     device: torch.device,
     epoch: int,
     drop_tasks: Set[str] | None = None,
+    amp_enabled: bool = False,
+    amp_dtype: torch.dtype = torch.bfloat16,
 ) -> Dict[str, torch.Tensor | Dict[str, float]]:
     del task_cache
     disabled = drop_tasks or set()
     training_cfg = config.get("training", {})
     neg_cfg = config.get("neg_sampling", {})
     use_task_routing = bool(training_cfg.get("use_task_routing", False))
+    # Build a context manager that no-ops when AMP is disabled or CUDA is missing.
+    if amp_enabled and torch.cuda.is_available():
+        amp_ctx = torch.autocast("cuda", dtype=amp_dtype)
+    else:
+        from contextlib import nullcontext
+        amp_ctx = nullcontext()
     
-    x = torch.nan_to_num(hg.x.to(device), nan=0.0, posinf=0.0, neginf=0.0)
-    node_emb, edge_emb, graph_emb, aux = encoder(
-        hg,
-        x,
-        motif_budget=int(training_cfg["motif_budget"]),
-        motifs=[],
-        communities=[],
-        motif_seed=epoch,
-    )
+    x = torch.nan_to_num(hg.x.to(device, non_blocking=True), nan=0.0, posinf=0.0, neginf=0.0)
+    with amp_ctx:
+        node_emb, edge_emb, graph_emb, aux = encoder(
+            hg,
+            x,
+            motif_budget=int(training_cfg["motif_budget"]),
+            motifs=[],
+            communities=[],
+            motif_seed=epoch,
+        )
     
     losses: Dict[str, torch.Tensor] = {}
     stats: Dict[str, float] = {
@@ -242,14 +251,15 @@ def compute_pretraining_losses(
         seed=epoch * 17 + 1,
         strategy="feature_masking",
     )
-    masked_node_emb, masked_edge_emb, _, masked_aux = encoder(
-        masked_view,
-        torch.nan_to_num(masked_view.x.to(device), nan=0.0, posinf=0.0, neginf=0.0),
-        motif_budget=0,
-        motifs=[],
-        communities=[],
-        motif_seed=epoch,
-    )
+    with amp_ctx:
+        masked_node_emb, masked_edge_emb, _, masked_aux = encoder(
+            masked_view,
+            torch.nan_to_num(masked_view.x.to(device, non_blocking=True), nan=0.0, posinf=0.0, neginf=0.0),
+            motif_budget=0,
+            motifs=[],
+            communities=[],
+            motif_seed=epoch,
+        )
     feature_mask = masked_view.metadata.get("feature_mask")
     masked_nodes = (
         feature_mask.any(dim=1).to(device)
@@ -264,11 +274,21 @@ def compute_pretraining_losses(
         target = x[masked_nodes]
         losses["masked_node"] = torch.nan_to_num(F.mse_loss(pred, target), nan=0.0, posinf=0.0, neginf=0.0)
 
-    hyperedge_neg_batch = sample_hyperedge_negatives(
-        hg,
-        cfg=dict(neg_cfg.get("hyperedge", {})),
-        rng=epoch * 97 + len(hg.hyperedges),
-    )
+    # Cache negative samples per (subhypergraph, epoch) so the heavy Python
+    # sampling only runs ONCE per subhypergraph per epoch instead of on every
+    # training step (which uses the same RNG seed within an epoch).
+    neg_cache = hg.metadata.setdefault("_neg_cache", {})
+    he_cache_key = (epoch, "hyperedge")
+    cached_he = neg_cache.get(he_cache_key)
+    if cached_he is not None:
+        hyperedge_neg_batch = cached_he
+    else:
+        hyperedge_neg_batch = sample_hyperedge_negatives(
+            hg,
+            cfg=dict(neg_cfg.get("hyperedge", {})),
+            rng=epoch * 97 + len(hg.hyperedges),
+        )
+        neg_cache[he_cache_key] = hyperedge_neg_batch
     stats.update(hyperedge_neg_batch.meta)
     if "hyperedge_recon" in disabled or edge_emb.numel() == 0:
         losses["hyperedge_recon"] = _zero(graph_emb)
@@ -280,11 +300,17 @@ def compute_pretraining_losses(
             neginf=0.0,
         )
 
-    membership_neg_batch = sample_membership_negatives(
-        hg,
-        cfg=dict(neg_cfg.get("membership", {})),
-        rng=epoch * 131 + hg.num_nodes,
-    )
+    mem_cache_key = (epoch, "membership")
+    cached_mem = neg_cache.get(mem_cache_key)
+    if cached_mem is not None:
+        membership_neg_batch = cached_mem
+    else:
+        membership_neg_batch = sample_membership_negatives(
+            hg,
+            cfg=dict(neg_cfg.get("membership", {})),
+            rng=epoch * 131 + hg.num_nodes,
+        )
+        neg_cache[mem_cache_key] = membership_neg_batch
     stats.update({**stats, **membership_neg_batch.meta})
     if "membership_contrast" in disabled:
         losses["membership_contrast"] = _zero(graph_emb)
@@ -303,14 +329,15 @@ def compute_pretraining_losses(
         seed=epoch * 17 + 2,
         strategy=str(training_cfg.get("contrastive_strategy", "node_dropping")),
     )
-    contrastive_node_emb, contrastive_edge_emb, _, contrastive_aux = encoder(
-        aug_view,
-        torch.nan_to_num(aug_view.x.to(device), nan=0.0, posinf=0.0, neginf=0.0),
-        motif_budget=0,
-        motifs=[],
-        communities=[],
-        motif_seed=epoch,
-    )
+    with amp_ctx:
+        contrastive_node_emb, contrastive_edge_emb, _, contrastive_aux = encoder(
+            aug_view,
+            torch.nan_to_num(aug_view.x.to(device, non_blocking=True), nan=0.0, posinf=0.0, neginf=0.0),
+            motif_budget=0,
+            motifs=[],
+            communities=[],
+            motif_seed=epoch,
+        )
     membership_cfg = dict(neg_cfg.get("membership", {}))
     min_nodes_for_node_contrastive = int(membership_cfg.get("min_nodes_for_node_contrastive", 16))
     min_edges_for_node_contrastive = int(membership_cfg.get("min_edges_for_node_contrastive", 2))

@@ -5,6 +5,10 @@ from typing import Dict, List, Set
 import time
 
 import torch
+try:
+    from torch.amp import GradScaler
+except ImportError:
+    from torch.cuda.amp import GradScaler
 from tqdm.auto import tqdm
 
 from models.encoder import UnifiedHypergraphEncoder
@@ -120,6 +124,13 @@ class PretrainTrainerNegSam(TrainerBase):
             lr=float(config["training"]["lr"]),
             weight_decay=float(config["training"]["weight_decay"]),
         )
+        # Mixed precision (bf16 on Ampere+, fp16 fallback) for 2-3x throughput on RTX 4090.
+        amp_cfg = config.get("training", {}).get("amp", {})
+        self.use_amp = bool(amp_cfg.get("enabled", True)) and torch.cuda.is_available()
+        amp_dtype = str(amp_cfg.get("dtype", "bf16")).lower()
+        self.amp_dtype = torch.bfloat16 if amp_dtype == "bf16" else torch.float16
+        self.scaler = GradScaler("cuda", enabled=self.use_amp and self.amp_dtype is torch.float16)
+        self.grad_clip_norm = float(config["training"].get("grad_clip_norm", 1.0))
         self.minibatch_config = dict(config.get("training", {}).get("minibatch", {}))
         self._log("Stage 3/4: building subhypergraph pools")
         self.pool_cache = self._build_pool_cache()
@@ -425,6 +436,8 @@ class PretrainTrainerNegSam(TrainerBase):
                 batch_stats = []
                 batch_quality_stats = []
                 
+                # Compute per-graph losses; KEEP computation graph for backward.
+                per_graph_total = []
                 for batch_index, hg in enumerate(batch_graphs):
                     hg.metadata["domain_id"] = self.training_domains.index(hg.domain) if hg.domain in self.training_domains else 0
                     loss_dict = compute_pretraining_losses(
@@ -436,9 +449,14 @@ class PretrainTrainerNegSam(TrainerBase):
                         device=self.device,
                         epoch=epoch,
                         drop_tasks=self.drop_tasks,
+                        amp_enabled=self.use_amp,
+                        amp_dtype=self.amp_dtype,
                     )
-                    batch_stats.append(dict(loss_dict.get("stats", {})))
+                    # Stats are floats/dicts - safe to detach.
+                    batch_stats.append({k: (float(v) if hasattr(v, "item") else v) for k, v in loss_dict.get("stats", {}).items()})
+                    # Loss tensors must NOT be detached yet - keep them for backward().
                     batch_loss_dicts.append({key: value for key, value in loss_dict.items() if key != "stats"})
+                    per_graph_total.append(loss_dict["total"])
                     
                     # Collect quality stats
                     quality_meta = batch_qualities[batch_index]
@@ -463,8 +481,43 @@ class PretrainTrainerNegSam(TrainerBase):
                             domain_id=quality_meta.domain_id,
                         )
                 
+                # === CRITICAL FIX: actually backprop and step the optimizer. ===
+                # Without this the model is never updated and losses never decrease.
+                if per_graph_total:
+                    step_loss = torch.stack(per_graph_total).mean()
+                    if self.use_amp and self.scaler is not None:
+                        self.scaler.scale(step_loss).backward()
+                        self.scaler.unscale_(self.optimizer)
+                        torch.nn.utils.clip_grad_norm_(
+                            list(self.encoder.parameters()) + list(self.heads.parameters()),
+                            max_norm=self.grad_clip_norm,
+                        )
+                        self.scaler.step(self.optimizer)
+                        self.scaler.update()
+                    else:
+                        step_loss.backward()
+                        torch.nn.utils.clip_grad_norm_(
+                            list(self.encoder.parameters()) + list(self.heads.parameters()),
+                            max_norm=self.grad_clip_norm,
+                        )
+                        self.optimizer.step()
+                # Detach per-graph losses for logging (do NOT touch in-graph tensors).
+                # Only scalar tensors (numel == 1) are loss values; multi-element
+                # entries would be metadata and must be skipped.
+                detached_batch_losses = []
+                for loss_dict in batch_loss_dicts:
+                    detached = {}
+                    for k, v in loss_dict.items():
+                        if hasattr(v, "detach"):
+                            t = v.detach()
+                            if t.numel() != 1:
+                                continue
+                            detached[k] = float(t.item())
+                        else:
+                            detached[k] = float(v)
+                    detached_batch_losses.append(detached)
                 # Compute averaged losses and stats after processing all graphs in batch
-                averaged_losses = self._aggregate_losses(batch_loss_dicts)
+                averaged_losses = self._aggregate_losses(detached_batch_losses)
                 averaged_stats = self._aggregate_stats(batch_stats, batch_quality_stats)
 
                 if step_bar is not None:
