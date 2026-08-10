@@ -57,7 +57,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=1e-2, help="Linear classifier LR.")
     parser.add_argument(
         "--config",
-        default="configs/finetune_node_smoke.yaml",
+        default="configs/pretrain_neg_sam_smoke.yaml",
         help="Downstream config for hidden_dim/num_layers/etc.",
     )
     parser.add_argument("--output", default="outputs/results/linear_probe_neg_sam.json")
@@ -220,7 +220,10 @@ def main() -> None:
         for variant, ckpt_path in [("pretrained", args.pretrained), ("random", None)]:
             enc = _build_encoder(cfg, device)
             if ckpt_path is not None and Path(ckpt_path).exists():
-                _load_encoder_weights(enc, ckpt_path, device)
+                n_loaded = _load_encoder_weights(enc, ckpt_path, device)
+                n_total = sum(1 for _ in enc.state_dict().keys())
+                if n_loaded < n_total * 0.5:
+                    print(f"  [WARN] only {n_loaded}/{n_total} encoder tensors matched (likely hidden_dim / num_layers mismatch). Pass --config <matching_pretrain_yaml> to load full weights.")
             else:
                 print(f"  [warn] {variant} checkpoint missing, using random init")
 
