@@ -33,7 +33,7 @@ def sparse_diagonal(diag, shape):
     return torch.sparse.FloatTensor(indexes, diag)
 
 def generate_indices_general(indexes, d):
-    d_range = torch.arange(d)
+    d_range = torch.arange(d, device=indexes.device)
     d_range_edges = d_range.repeat(d).view(-1,1) #0,1..d,0,1..d..   d*d elems
     d_range_nodes = d_range.repeat_interleave(d).view(-1,1) #0,0..0,1,1..1..d,d..d  d*d elems
     indexes = indexes.unsqueeze(1) 
@@ -385,16 +385,16 @@ class HyperDiffusionDiagSheafConv(MessagePassing):
 
         #negate the diagonal blocks and add eye matrix
         if self.I_mask is None or self.clear_flag: #prepare these in advance
-            I_mask_indices = torch.stack([torch.arange(num_nodes), torch.arange(num_nodes)], dim=0)
+            I_mask_indices = torch.stack([torch.arange(num_nodes, device=self.device), torch.arange(num_nodes, device=self.device)], dim=0)
             I_mask_indices = generate_indices_general(I_mask_indices, self.d)
-            I_mask_values = torch.ones((I_mask_indices.shape[1]))
-            self.I_mask = torch.sparse_coo_tensor(I_mask_indices, I_mask_values).to(self.device)
-            self.Id = sparse_diagonal(torch.ones(num_nodes*self.d), shape = (num_nodes*self.d, num_nodes * self.d)).to(self.device)
+            I_mask_values = torch.ones((I_mask_indices.shape[1]), device=self.device)
+            self.I_mask = torch.sparse_coo_tensor(I_mask_indices, I_mask_values, device=self.device)
+            self.Id = sparse_diagonal(torch.ones(num_nodes*self.d, device=self.device), shape = (num_nodes*self.d, num_nodes * self.d)).to(self.device)
 
         minus_L = minus_L.coalesce()
         #this help us changing the sign of the elements in the block diagonal
         #with an efficient lower=memory mask 
-        minus_L = torch.sparse_coo_tensor(minus_L.indices(), minus_L.values(), minus_L.size())
+        minus_L = torch.sparse_coo_tensor(minus_L.indices(), minus_L.values(), minus_L.size(), device=self.device)
         minus_L = minus_L - 2 * minus_L.mul(self.I_mask)
         minus_L = self.Id + minus_L
 

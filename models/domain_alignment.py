@@ -166,6 +166,9 @@ def prototype_alignment_loss(
         Prototype alignment loss
     """
     if mask is not None:
+        # Convert to bool if mask is float tensor (e.g., from confidence scoring)
+        if mask.dtype == torch.float32:
+            mask = mask.bool()
         z = z[mask]
         proto_ids = proto_ids[mask]
 

@@ -73,13 +73,15 @@ class NodeConfidenceScorer(nn.Module):
             dense_inc = incidence
 
         # Node degree score (normalized)
+        device = incidence.device
         if node_degrees is None:
             node_degrees = dense_inc.sum(dim=1)
-        degree_score = (node_degrees / max(node_degrees.max().item(), 1.0)).clamp(0, 1)
+        degree_score = (node_degrees / max(node_degrees.max().item(), 1.0)).clamp(0, 1).to(device)
 
         # Overlap score: how many hyperedges share nodes
         # Higher overlap suggests more structural integration
-        overlap_score = torch.zeros(num_nodes)
+        device = incidence.device
+        overlap_score = torch.zeros(num_nodes, device=device)
         for i in range(num_nodes):
             incident_edges = dense_inc[i].nonzero(as_tuple=True)[0]
             if incident_edges.numel() > 1:
@@ -94,7 +96,7 @@ class NodeConfidenceScorer(nn.Module):
                 overlap_score[i] = 0.0
 
         # Validity score: node should have at least some connections
-        validity_score = (node_degrees > 0).float()
+        validity_score = (node_degrees > 0).float().to(device)
 
         # Combine scores with weights
         confidence = (

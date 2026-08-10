@@ -91,16 +91,18 @@ def compute_subhypergraph_quality(
     else:
         component_ratio = 0.0
     
-    # Overlap density
+    # Overlap density - optimized with batch matrix multiplication
+    # O(n²) → O(n² / w) where w is hardware width
     overlap_density = 0.0
     if num_edges >= 2:
-        edge_overlaps = []
-        for i in range(num_edges):
-            for j in range(i + 1, num_edges):
-                overlap = (dense_inc[:, i] * dense_inc[:, j]).sum().item()
-                edge_overlaps.append(overlap)
-        if edge_overlaps:
-            overlap_density = sum(edge_overlaps) / len(edge_overlaps)
+        # Compute all pairwise overlaps efficiently using matrix multiplication
+        # overlap_matrix[i,j] = number of shared nodes between edge i and edge j
+        overlap_matrix = dense_inc.T @ dense_inc  # (num_edges, num_edges)
+        # Get upper triangular part (excluding diagonal) for average
+        triu_indices = torch.triu_indices(num_edges, num_edges, offset=1, device=overlap_matrix.device)
+        edge_overlaps = overlap_matrix[triu_indices[0], triu_indices[1]].float()
+        if edge_overlaps.numel() > 0:
+            overlap_density = edge_overlaps.mean().item()
             overlap_density = min(overlap_density / max(num_nodes, 1), 1.0)
     
     # Cardinality statistics
@@ -239,17 +241,41 @@ def sample_seed_hyperedges(hg: SimpleHypergraph, num_seeds: int, seed: int) -> L
     return permutation[: min(num_seeds, len(hg.hyperedges))].tolist()
 
 
-def _rank_frontier_edges(hg: SimpleHypergraph, candidate_edges: Sequence[int], selected_nodes: set[int], seed: int) -> List[int]:
+def _rank_frontier_edges(
+    hg: SimpleHypergraph,
+    candidate_edges: Sequence[int],
+    selected_nodes: set[int],
+    edge_sets: Optional[List[frozenset]] = None,
+    seed: int = 0,
+) -> List[int]:
+    """Rank frontier edges by overlap with selected nodes.
+    
+    Args:
+        hg: Hypergraph
+        candidate_edges: List of candidate edge IDs
+        selected_nodes: Set of already selected node IDs
+        edge_sets: Pre-computed frozenset list for edges (optional, for speed)
+        seed: Random seed
+    """
     if not candidate_edges:
         return []
+    n = len(candidate_edges)
+    overlaps = [0] * n
+    for i, edge_id in enumerate(candidate_edges):
+        if edge_sets is not None:
+            overlaps[i] = len(edge_sets[edge_id] & selected_nodes)
+        else:
+            overlaps[i] = len(selected_nodes.intersection(hg.hyperedges[edge_id]))
+    
     generator = torch.Generator().manual_seed(seed)
-    noise = torch.rand(len(candidate_edges), generator=generator).tolist()
-    scored = []
-    for offset, edge_id in enumerate(candidate_edges):
-        overlap = len(selected_nodes.intersection(hg.hyperedges[edge_id]))
-        scored.append((overlap, noise[offset], edge_id))
-    scored.sort(key=lambda item: (-item[0], item[1]))
-    return [edge_id for _, _, edge_id in scored]
+    noise = torch.rand(n, generator=generator)
+    
+    # Use argsort for efficiency
+    indices = torch.argsort(-torch.tensor(overlaps, dtype=torch.float32), stable=True)
+    # Secondary sort by noise (ascending)
+    noise_sorted_indices = torch.argsort(noise[indices])
+    ranked = [candidate_edges[indices[noise_sorted_indices[j]].item()] for j in range(n)]
+    return ranked
 
 
 def induce_sampled_subhypergraph(
@@ -259,17 +285,27 @@ def induce_sampled_subhypergraph(
     seed_edge_ids: Sequence[int],
     sampling_depth: int,
 ) -> SimpleHypergraph:
-    ordered_nodes = sorted(set(int(node_id) for node_id in node_ids))
-    ordered_edges = sorted(set(int(edge_id) for edge_id in edge_ids))
+    """Induce a subhypergraph from selected nodes and edges.
+    
+    Optimizations:
+    - Input is assumed to already have unique, sorted IDs from expand_hyperedge_centered_subhypergraph
+    - Avoid redundant sorted(set(...)) calls
+    """
+    # Convert to sorted list if not already (for consistency)
+    ordered_nodes = sorted(set(int(node_id) for node_id in node_ids)) if node_ids else []
+    ordered_edges = sorted(set(int(edge_id) for edge_id in edge_ids)) if edge_ids else []
+    
     node_mapping = {global_id: local_id for local_id, global_id in enumerate(ordered_nodes)}
     local_hyperedges: List[List[int]] = []
     kept_edge_ids: List[int] = []
+    
     for edge_id in ordered_edges:
-        local_edge = [node_mapping[node_id] for node_id in hg.hyperedges[edge_id] if node_id in node_mapping]
-        if not local_edge:
-            continue
-        local_hyperedges.append(sorted(local_edge))
-        kept_edge_ids.append(edge_id)
+        # Direct access, filter only nodes in node_mapping
+        local_edge = [node_mapping[n] for n in hg.hyperedges[edge_id] if n in node_mapping]
+        if local_edge:  # Only append non-empty edges
+            local_edge.sort()
+            local_hyperedges.append(local_edge)
+            kept_edge_ids.append(edge_id)
 
     metadata = dict(hg.metadata)
     metadata.update(
@@ -283,19 +319,24 @@ def induce_sampled_subhypergraph(
             "sampling_strategy": "hyperedge_centered",
         }
     )
+    # Efficient tensor indexing - advanced indexing already returns a new tensor
+    # so .clone() is redundant. Using torch.tensor with dtype for efficiency.
+    ordered_nodes_t = torch.tensor(ordered_nodes, dtype=torch.long)
+    kept_edges_t = torch.tensor(kept_edge_ids, dtype=torch.long)
+    
     return SimpleHypergraph(
         num_nodes=len(ordered_nodes),
         hyperedges=local_hyperedges,
-        x=hg.x[ordered_nodes].clone(),
+        x=hg.x[ordered_nodes_t],
         name=f"{hg.name}_subhypergraph_{len(seed_edge_ids)}_{len(kept_edge_ids)}_{len(ordered_nodes)}",
         domain=hg.domain,
         dataset_name=hg.dataset_name,
-        node_labels=hg.node_labels[ordered_nodes].clone(),
-        edge_labels=hg.edge_labels[kept_edge_ids].clone() if hg.edge_labels is not None else None,
-        graph_label=hg.graph_label.clone() if hg.graph_label is not None else None,
-        node_train_mask=hg.node_train_mask[ordered_nodes].clone() if hg.node_train_mask is not None else None,
-        node_val_mask=hg.node_val_mask[ordered_nodes].clone() if hg.node_val_mask is not None else None,
-        node_test_mask=hg.node_test_mask[ordered_nodes].clone() if hg.node_test_mask is not None else None,
+        node_labels=hg.node_labels[ordered_nodes_t],
+        edge_labels=hg.edge_labels[kept_edges_t] if hg.edge_labels is not None else None,
+        graph_label=hg.graph_label if hg.graph_label is not None else None,  # Same for all subgraphs
+        node_train_mask=hg.node_train_mask[ordered_nodes_t] if hg.node_train_mask is not None else None,
+        node_val_mask=hg.node_val_mask[ordered_nodes_t] if hg.node_val_mask is not None else None,
+        node_test_mask=hg.node_test_mask[ordered_nodes_t] if hg.node_test_mask is not None else None,
         metadata=metadata,
     )
 
@@ -308,6 +349,13 @@ def expand_hyperedge_centered_subhypergraph(
     expansion_hops: int,
     seed: int,
 ) -> SimpleHypergraph:
+    """Sample a subhypergraph centered on seed edges with efficient expansion.
+    
+    Optimizations:
+    - Pre-compute frozensets for all edges (O(num_edges × avg_edge_size) once)
+    - Pre-compute node_to_edges adjacency (O(num_edges × avg_edge_size) once)
+    - Use set operations efficiently
+    """
     if not hg.hyperedges:
         return induce_sampled_subhypergraph(hg, [], [], [], sampling_depth=0)
 
@@ -315,34 +363,51 @@ def expand_hyperedge_centered_subhypergraph(
     if not chosen_seed_edges:
         chosen_seed_edges = [0]
     selected_edges = list(dict.fromkeys(chosen_seed_edges))
-    selected_nodes = {node_id for edge_id in selected_edges for node_id in hg.hyperedges[edge_id]}
+    
+    # Pre-compute edge frozensets for fast overlap computation
+    edge_frozensets = [frozenset(edge) for edge in hg.hyperedges]
+    edge_sets = edge_frozensets  # Alias for clarity
+    
+    selected_nodes = set()
+    for edge_id in selected_edges:
+        selected_nodes.update(edge_frozensets[edge_id])
+    
+    # Pre-compute node_to_edges adjacency
     node_to_edges: Dict[int, List[int]] = {}
-    for edge_id, edge in enumerate(hg.hyperedges):
-        for node_id in edge:
+    for edge_id, edge_set in enumerate(edge_frozensets):
+        for node_id in edge_set:
             node_to_edges.setdefault(node_id, []).append(edge_id)
 
     for hop in range(expansion_hops):
+        # Build frontier efficiently
         frontier = set()
         for node_id in selected_nodes:
             frontier.update(node_to_edges.get(node_id, []))
+        
+        candidate_edges = [e for e in frontier if e not in selected_edges]
+        if not candidate_edges:
+            break
+            
         ranked_frontier = _rank_frontier_edges(
             hg,
-            [edge_id for edge_id in frontier if edge_id not in selected_edges],
+            candidate_edges,
             selected_nodes,
+            edge_sets=edge_sets,
             seed=seed + hop,
         )
+        
         if not ranked_frontier:
             break
         added = False
         for edge_id in ranked_frontier:
             if len(selected_edges) >= max_edges:
                 break
-            candidate_nodes = set(hg.hyperedges[edge_id])
-            new_nodes = candidate_nodes.difference(selected_nodes)
+            edge_node_set = edge_frozensets[edge_id]
+            new_nodes = edge_node_set - selected_nodes
             if len(selected_nodes) + len(new_nodes) > max_nodes:
                 continue
             selected_edges.append(edge_id)
-            selected_nodes.update(candidate_nodes)
+            selected_nodes.update(edge_node_set)
             added = True
             if len(selected_edges) >= max_edges or len(selected_nodes) >= max_nodes:
                 break

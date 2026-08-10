@@ -530,6 +530,7 @@ def create_model_wrapper(model_name: str, num_features: int, num_classes: int, p
                     'All_num_layers': params['layers'],
                     'dropout': params['dropout'],
                     'MLP_hidden': params['hidden'],
+                    'MLP_num_layers': params.get('MLP_num_layers', 2),
                     'aggregate': params.get('aggregate', 'mean'),
                     'normalization': params.get('normalization', 'bn'),
                     'deepset_input_norm': params.get('AllSet_input_norm', True),
@@ -537,6 +538,8 @@ def create_model_wrapper(model_name: str, num_features: int, num_classes: int, p
                     'LearnMask': params.get('LearnMask', False),
                     'decoder_hidden': params.get('decoder_hidden', 128),
                     'decoder_num_layers': params.get('decoder_num_layers', 1),
+                    'heads': params.get('heads', 1),
+                    'PMA': params.get('PMA', True),
                 })
                 self.model = SetGNN(num_features, num_classes, args)
                 
@@ -612,6 +615,9 @@ def create_model_wrapper(model_name: str, num_features: int, num_classes: int, p
                     'sheaf_normtype': params.get('sheaf_normtype', 'degree_norm'),
                     'sheaf_act': params.get('sheaf_act', 'relu'),
                     'sheaf_left_proj': params.get('sheaf_left_proj', True),
+                    'sheaf_dropout': params.get('sheaf_dropout', 0.0),
+                    'sheaf_pred_block': params.get('sheaf_pred_block', 'MLP_var3'),
+                    'sheaf_special_head': params.get('sheaf_special_head', False),
                     'AllSet_input_norm': params.get('AllSet_input_norm', True),
                     'device': params.get('device', 0),
                     'task_type': 'node_cls',

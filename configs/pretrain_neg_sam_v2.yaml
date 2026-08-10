@@ -68,7 +68,7 @@ training:
     expansion_hops: 2
     seed_edges_per_subhypergraph: 1
     use_subhypergraph_pool: true
-    subhypergraph_pool_size: 512
+    subhypergraph_pool_size: 64  # Reduced from 512 for faster pool building
     large_graph_node_threshold: 5000
   
   # === Challenge 1: Cross-Domain Disentanglement & Alignment ===
@@ -153,7 +153,7 @@ data:
     - citeseer_cc
     - pubmed_cc
     - coauthorship_dblp
-    - imdb_4k
+    # - imdb_4k  # IMDB4k not available in dhg
     - cooking_200
     - gowalla
     - yelp_2018
@@ -162,7 +162,6 @@ data:
     citeseer_cc: citation
     pubmed_cc: citation
     coauthorship_dblp: academic
-    imdb_4k: academic
     cooking_200: document
     gowalla: recommendation
     yelp_2018: recommendation

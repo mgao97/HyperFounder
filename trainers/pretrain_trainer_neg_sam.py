@@ -173,6 +173,52 @@ class PretrainTrainerNegSam(TrainerBase):
             parts.append(f"{hg.dataset_name}/{hg.domain}(nodes={hg.num_nodes}, edges={len(hg.hyperedges)})")
         return "; ".join(parts)
 
+    def _aggregate_losses(self, batch_loss_dicts: List[Dict]) -> Dict[str, float]:
+        """Aggregate losses across a batch of graphs."""
+        if not batch_loss_dicts:
+            return {"total": 0.0}
+        # Sum all losses
+        aggregated = {}
+        for loss_dict in batch_loss_dicts:
+            for key, value in loss_dict.items():
+                if key == "stats":
+                    continue  # Skip stats, handle separately
+                if isinstance(value, torch.Tensor):
+                    value = value.item()
+                if isinstance(value, (int, float)):
+                    aggregated[key] = aggregated.get(key, 0.0) + float(value)
+        # Average by batch size
+        n = len(batch_loss_dicts)
+        for key in aggregated:
+            aggregated[key] /= n
+        # Compute total loss
+        loss_keys = [k for k in aggregated.keys() if k != "total"]
+        aggregated["total"] = sum(aggregated.get(k, 0.0) for k in loss_keys)
+        return aggregated
+
+    def _aggregate_stats(
+        self,
+        batch_stats: List[Dict],
+        batch_quality_stats: List[Dict],
+    ) -> Dict[str, float]:
+        """Aggregate stats across a batch of graphs."""
+        aggregated = {}
+        # Aggregate from batch_stats
+        for stats in batch_stats:
+            for key, value in stats.items():
+                if isinstance(value, (int, float)):
+                    aggregated[key] = aggregated.get(key, 0.0) + value
+        # Aggregate from batch_quality_stats
+        for stats in batch_quality_stats:
+            for key, value in stats.items():
+                if isinstance(value, (int, float)):
+                    aggregated[key] = aggregated.get(key, 0.0) + value
+        # Average by batch size
+        n = len(batch_stats) if batch_stats else 1
+        for key in aggregated:
+            aggregated[key] /= n
+        return aggregated
+
     def _log_startup_info(self) -> None:
         dataset_names = ", ".join(self.training_datasets) if self.training_datasets else "-"
         domain_names = ", ".join(self.training_domains) if self.training_domains else "-"
@@ -413,11 +459,16 @@ class PretrainTrainerNegSam(TrainerBase):
                             quality_score=quality_meta.quality_score,
                             domain_id=quality_meta.domain_id,
                         )
-                    if step_bar is not None:
-                        step_bar.update(1)
-                        step_bar.set_postfix(
-                        loss=f"{averaged_losses['total']:.4f}",
-                        neg=f"{averaged_stats['num_hyperedge_negatives']:.1f}/{averaged_stats['num_membership_negatives']:.1f}",
+                
+                # Compute averaged losses and stats after processing all graphs in batch
+                averaged_losses = self._aggregate_losses(batch_loss_dicts)
+                averaged_stats = self._aggregate_stats(batch_stats, batch_quality_stats)
+
+                if step_bar is not None:
+                    step_bar.update(1)
+                    step_bar.set_postfix(
+                        loss=f"{averaged_losses.get('total', 0.0):.4f}",
+                        neg=f"{averaged_stats.get('num_hyperedge_negatives', 0.0):.1f}/{averaged_stats.get('num_membership_negatives', 0.0):.1f}",
                         refresh=False,
                     )
                 if log_step_history:
@@ -433,32 +484,32 @@ class PretrainTrainerNegSam(TrainerBase):
                             "avg_nodes": float(sum(hg.num_nodes for hg in batch_graphs) / max(len(batch_graphs), 1)),
                             "avg_edges": float(sum(len(hg.hyperedges) for hg in batch_graphs) / max(len(batch_graphs), 1)),
                             **{f"domain_{name}": float(step_domain_counts[name]) for name in self.training_domains},
-                            **{f"loss_{key}": float(averaged_losses[key]) for key in epoch_losses},
-                            **{f"stat_{key}": float(averaged_stats[key]) for key in epoch_stats},
+                            **{f"loss_{key}": float(averaged_losses.get(key, 0.0)) for key in epoch_losses},
+                            **{f"stat_{key}": float(averaged_stats.get(key, 0.0)) for key in epoch_stats},
                         }
                     )
                 for key in epoch_losses:
-                    epoch_losses[key] += averaged_losses[key]
+                    epoch_losses[key] += averaged_losses.get(key, 0.0)
                 for key in epoch_stats:
-                    epoch_stats[key] += averaged_stats[key]
+                    epoch_stats[key] += averaged_stats.get(key, 0.0)
                 if step == 0 or (step + 1) % log_interval_steps == 0 or step + 1 == steps_per_epoch:
                     self._log(
                         f"Epoch {epoch}/{epochs} step {step + 1}/{steps_per_epoch}: "
                         f"preferred_domains={','.join(step_domains) if step_domains else '-'} "
-                        f"batch_size={len(batch_graphs)} total={averaged_losses['total']:.4f} "
-                        f"masked_node={averaged_losses['masked_node']:.4f} "
-                        f"hyperedge_recon={averaged_losses['hyperedge_recon']:.4f} "
-                        f"contrastive={averaged_losses['contrastive']:.4f} "
-                        f"size_pred={averaged_losses['size_pred']:.4f} "
-                        f"domain_align={averaged_losses['domain_align']:.4f} "
-                        f"membership_contrast={averaged_losses['membership_contrast']:.4f} "
-                        f"motif={averaged_losses['motif']:.4f} "
-                        f"community={averaged_losses['community']:.4f} "
-                        f"structure_align={averaged_losses['structure_align']:.4f} "
-                        f"neg_hyperedges={averaged_stats['num_hyperedge_negatives']:.1f} "
-                        f"neg_memberships={averaged_stats['num_membership_negatives']:.1f} "
-                        f"avg_neg_overlap={averaged_stats['avg_negative_overlap']:.2f} "
-                        f"avg_membership_hop={averaged_stats['avg_membership_hop']:.2f} "
+                        f"batch_size={len(batch_graphs)} total={averaged_losses.get('total', 0.0):.4f} "
+                        f"masked_node={averaged_losses.get('masked_node', 0.0):.4f} "
+                        f"hyperedge_recon={averaged_losses.get('hyperedge_recon', 0.0):.4f} "
+                        f"contrastive={averaged_losses.get('contrastive', 0.0):.4f} "
+                        f"size_pred={averaged_losses.get('size_pred', 0.0):.4f} "
+                        f"domain_align={averaged_losses.get('domain_align', 0.0):.4f} "
+                        f"membership_contrast={averaged_losses.get('membership_contrast', 0.0):.4f} "
+                        f"motif={averaged_losses.get('motif', 0.0):.4f} "
+                        f"community={averaged_losses.get('community', 0.0):.4f} "
+                        f"structure_align={averaged_losses.get('structure_align', 0.0):.4f} "
+                        f"neg_hyperedges={averaged_stats.get('num_hyperedge_negatives', 0.0):.1f} "
+                        f"neg_memberships={averaged_stats.get('num_membership_negatives', 0.0):.1f} "
+                        f"avg_neg_overlap={averaged_stats.get('avg_negative_overlap', 0.0):.2f} "
+                        f"avg_membership_hop={averaged_stats.get('avg_membership_hop', 0.0):.2f} "
                         f"batch_graphs=[{self._describe_batch_graphs(batch_graphs)}]"
                     )
             if step_bar is not None:
