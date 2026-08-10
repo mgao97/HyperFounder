@@ -1,0 +1,38 @@
+# Finetune config that loads the neg_sam_v2 pretrained checkpoint.
+# Architecture matches configs/pretrain_neg_sam_v2.yaml so shapes align.
+# Use with: python scripts/run_transfer.py --config configs/finetune_node_v2.yaml --heldout_domain <citation|academic|recommendation|...>
+
+model:
+  input_dim: 128
+  hidden_dim: 128
+  dropout: 0.3
+  num_layers: 4
+  num_heads: 8
+  structure_pe_dim: 8
+
+training:
+  seed: 7
+  device: cuda            # GPU server has 8x 4090
+  lr: 0.001
+  weight_decay: 0.0005
+  finetune_epochs: 200
+  num_seeds: 3            # report mean ± std
+  early_stopping:
+    patience: 50
+  output_dir: outputs
+  pretrained_checkpoint: outputs_neg_sam_v2/checkpoints/pretrain_best_neg_sam.pt
+  task_name: node
+
+data:
+  datasets:
+    - cora
+    - citeseer
+    - pubmed
+  domain_map:
+    cora: citation
+    citeseer: citation
+    pubmed: citation
+  cache_dir: data/cache
+  splits:
+    train_ratio: 0.6
+    val_ratio: 0.2
