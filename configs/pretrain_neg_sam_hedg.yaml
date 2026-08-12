@@ -1,0 +1,159 @@
+# Pretraining config for the HEDG-Weighted Hard Negative Sampling variant.
+# This is a thin wrapper over the existing pretrain_neg_sam_v2 pipeline:
+#   - Same model, same training loop, same 8 tasks
+#   - neg_sampling block is replaced by hedg_negatives block
+#   - To actually use HEDG sampling, set USE_HEDG_NEGATIVES=1
+#     in the environment when running scripts/run_pretrain_hedg.sh.
+#     The runner will swap the in-trainer negative sampler to use
+#     models.hedg_negative_sampling.HEDGNegativeSampler.
+#
+# This file does NOT modify any existing file. It is meant as a
+# standalone config for the HEDG ablation experiments.
+
+model:
+  input_dim: 128
+  hidden_dim: 128
+  dropout: 0.1
+  num_layers: 2
+  num_heads: 4
+  structure_pe_dim: 4
+  use_domain_adapter: true
+  adapter_type: adapter
+  adapter_dim: 16
+  num_experts: 2
+
+training:
+  seed: 7
+  device: cpu
+  epochs: 3               # quick ablation: 3 epochs is enough to see HEDG effect
+  steps_per_epoch: 8
+  enabled_tasks:
+    - masked_node
+    - hyperedge_recon
+    - contrastive
+    - domain_align
+    - orth_node
+    - orth_edge
+    - private_domain_node
+    - private_domain_edge
+  log_step_history: false
+  log_interval_steps: 1
+  lr: 0.001
+  weight_decay: 0.0001
+  motif_budget: 8
+  feature_mask_rate: 0.15
+  edge_dropout_rate: 0.2
+  contrastive_strategy: node_dropping
+  contrastive_temperature: 0.1
+  min_masked_nodes: 2
+  use_task_routing: false
+  num_motif_types: 4
+  num_prototypes: 4
+  output_dir: outputs_neg_sam_hedg
+  early_stopping:
+    patience: 100
+  progress:
+    show_epoch_bar: false
+    show_step_bar: false
+    show_pool_bar: false
+    leave_progress_bar: false
+    mininterval_sec: 1.0
+  minibatch:
+    domains_per_step: 1
+    subhypergraphs_per_domain: 1
+    max_nodes: 64
+    max_edges: 32
+    expansion_hops: 1
+    seed_edges_per_subhypergraph: 1
+    use_subhypergraph_pool: false
+    subhypergraph_pool_size: 0
+    large_graph_node_threshold: 100000
+
+  # Mixed precision (CPU-safe: disabled here)
+  amp:
+    enabled: false
+    dtype: bf16
+  grad_clip_norm: 1.0
+
+  use_disentanglement: true
+  shared_dim: 64
+  private_dim: 64
+  use_domain_alignment: true
+  use_node_alignment: true
+  use_edge_alignment: true
+  alignment_proj_dim: 32
+  node_num_prototypes: 8
+  edge_num_prototypes: 8
+  use_confidence_routing: true
+  tau_node_align: 0.6
+  tau_edge_align: 0.65
+  tau_neg_low: 0.4
+
+  use_quality_routing: true
+  quality_min_nodes: 2
+  quality_min_edges: 1
+  tau_hyperedge: 0.55
+  tau_motif: 0.70
+  tau_membership: 0.40
+  tau_hard_negative: 0.40
+  min_membership_nodes: 2
+
+  use_hard_negative_bank: false
+  hard_negative_bank_size: 0
+  log_quality_stats: false
+
+  # HEDG-Weighted negative sampling parameters
+  # (used when the HEDG swap-in is enabled via env var)
+  hedg_negatives:
+    enabled: true               # master switch
+    temperature: 0.5            # τ; lower = harder negatives
+    num_negatives: 2
+    hard_min_overlap: 1         # HEDG edge weight threshold
+    perturbation_rate: 0.2      # fraction of donor nodes to swap
+    fallback_to_random: true    # if no HEDG neighbor
+    seed: 7
+
+  loss_weights:
+    masked_node: 1.0
+    hyperedge_recon: 1.0
+    contrastive: 1.0
+    size_pred: 0.0             # dropped (redundant)
+    domain_align: 0.1
+    membership_contrast: 0.5   # ↑ (boosted — HEDG is most useful here)
+    motif: 0.0                 # dropped (expensive, low transfer)
+    community: 0.0             # dropped (overlaps with multi-granularity)
+    structure_align: 0.0       # dropped (overlaps with cross-view)
+    structure_discrimination: 0.0  # dropped (overlaps with quality routing)
+    orth_node: 0.02
+    orth_edge: 0.02
+    private_domain_node: 0.05
+    private_domain_edge: 0.05
+
+neg_sampling:
+  # The original 3-mode block is kept for backward compatibility with
+  # any code path that doesn't enable HEDG. When HEDG is enabled, this
+  # block is ignored and hedg_negatives above is used instead.
+  hyperedge:
+    num_neg_per_pos: 2
+    modes: [replace, overlap, random]
+    min_negative_edge_size: 2
+    max_attempts: 10
+  membership:
+    num_neg_per_pos: 2
+    max_membership_hop: 3
+    min_nodes_for_node_contrastive: 4
+    min_edges_for_node_contrastive: 1
+  subgraph:
+    num_neg_per_pos: 2
+
+data:
+  datasets:
+    - cora_cc
+    - cooking_200
+  domain_map:
+    cora_cc: citation
+    cooking_200: document
+  cache_dir: data/cache
+  splits:
+    train_ratio: 0.6
+    val_ratio: 0.2
