@@ -131,6 +131,20 @@ neg_sampling:
     min_overlap_density: 0.05
     min_incidence_density: 0.05
     min_component_ratio: 0.5
+  # HEDG-Weighted Hard Negative Sampling (single principled mechanism)
+  # Activated by setting USE_HEDG_NEGATIVES=1 in the environment.
+  # When enabled, this REPLACES the 3-mode hyperedge and 2-hop
+  # membership samplers with a single HEDG-driven sampler that
+  # uses the hyperedge dependency graph (HEDG) as the source of
+  # negative difficulty (see docs/HEDG_NEGATIVES.md).
+  hedg_negatives:
+    enabled: true
+    temperature: 0.5
+    num_negatives: 2
+    hard_min_overlap: 1
+    perturbation_rate: 0.2
+    fallback_to_random: true
+    max_membership_hop: 2
 
 data:
   datasets:

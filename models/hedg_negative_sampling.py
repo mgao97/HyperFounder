@@ -43,9 +43,11 @@ from utils.hypergraph import SimpleHypergraph
 @dataclass
 class HEDGHyperedgeNegatives:
     """Container for hard-negative edge indices + similarity stats."""
-    pos_edge_indices: torch.Tensor          # (P,) positive edge indices
+    pos_edge_indices: torch.Tensor          # (P,) positive edge indices (NOT repeated)
+    pos_edge_indices_repeated: torch.Tensor  # (P*N,) pos repeated N times to match neg
     neg_edge_indices: torch.Tensor          # (P*N,) flat negative edge indices
     neg_similarities: torch.Tensor          # (P*N,) HEDG similarity of each neg
+    neg_counts: List[int]                  # (P,) actual number of negs per positive
     meta: Dict[str, float]
 
 
@@ -194,12 +196,15 @@ class HEDGNegativeSampler:
         if not positive_edge_indices:
             return HEDGHyperedgeNegatives(
                 pos_edge_indices=torch.empty(0, dtype=torch.long),
+                pos_edge_indices_repeated=torch.empty(0, dtype=torch.long),
                 neg_edge_indices=torch.empty(0, dtype=torch.long),
                 neg_similarities=torch.empty(0, dtype=torch.float),
+                neg_counts=[],
                 meta={"num_pos": 0, "num_neg": 0},
             )
 
         pos_list: List[int] = []
+        neg_counts_per_pos: List[int] = []
         neg_list: List[int] = []
         sim_list: List[float] = []
         n_hard_used = 0
@@ -255,8 +260,10 @@ class HEDGNegativeSampler:
         if not pos_list:
             return HEDGHyperedgeNegatives(
                 pos_edge_indices=torch.empty(0, dtype=torch.long),
+                pos_edge_indices_repeated=torch.empty(0, dtype=torch.long),
                 neg_edge_indices=torch.empty(0, dtype=torch.long),
                 neg_similarities=torch.empty(0, dtype=torch.float),
+                neg_counts=[],
                 meta={"num_pos": 0, "num_neg": 0},
             )
 
@@ -268,10 +275,20 @@ class HEDGNegativeSampler:
             "n_hard_used": float(n_hard_used),
             "n_random_fallback": float(n_random_fallback),
         }
+        # Build the legacy (P*N,) repeated-pos tensor to match the 3-mode
+        # layout. pos_list[k] corresponds to neg_list[cursor : cursor+n_k]
+        # where n_k = neg_counts_per_pos[k] is the actual number of negs
+        # for that positive (which may be < num_negatives when HEDG has
+        # too few candidates for that positive).
+        pos_repeated: List[int] = []
+        for p, n in zip(pos_list, neg_counts_per_pos):
+            pos_repeated.extend([p] * n)
         return HEDGHyperedgeNegatives(
             pos_edge_indices=torch.tensor(pos_list, dtype=torch.long),
+            pos_edge_indices_repeated=torch.tensor(pos_repeated, dtype=torch.long),
             neg_edge_indices=torch.tensor(neg_list, dtype=torch.long),
             neg_similarities=torch.tensor(sim_list, dtype=torch.float),
+            neg_counts=list(neg_counts_per_pos),
             meta=meta,
         )
 

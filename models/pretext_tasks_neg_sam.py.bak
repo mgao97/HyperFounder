@@ -13,21 +13,6 @@ from models.negative_sampling_neg_sam import (
     sample_hyperedge_negatives,
     sample_membership_negatives,
 )
-import os as _os
-_USE_HEDG_NEGATIVES = _os.environ.get("USE_HEDG_NEGATIVES", "0") == "1"
-if _USE_HEDG_NEGATIVES:
-    try:
-        from models.hedg_integration import (
-            build_hedg_sampler,
-            hedg_to_hyperedge_batch,
-            hedg_to_membership_batch,
-        )
-        _HEDG_INTEGRATION_AVAILABLE = True
-    except ImportError as _e:
-        _HEDG_INTEGRATION_AVAILABLE = False
-        print(f"[pretext_tasks_neg_sam] HEDG integration unavailable: {_e}")
-else:
-    _HEDG_INTEGRATION_AVAILABLE = False
 from utils.hypergraph import SimpleHypergraph
 from utils.sampling import augment_hypergraph
 
@@ -298,22 +283,11 @@ def compute_pretraining_losses(
     if cached_he is not None:
         hyperedge_neg_batch = cached_he
     else:
-        if _USE_HEDG_NEGATIVES and _HEDG_INTEGRATION_AVAILABLE and bool(neg_cfg.get("hedg_negatives", {}).get("enabled", False)):
-            hedg_cfg = dict(neg_cfg.get("hedg_negatives", {}))
-            hedg_sampler = build_hedg_sampler(
-                hg, hedg_cfg, seed=epoch * 97 + len(hg.hyperedges) + 1
-            )
-            hedg_result = hedg_sampler.sample_hyperedge_negatives(
-                list(range(len(hg.hyperedges))),
-                generator=None,  # sampler uses its own seeded RNG
-            )
-            hyperedge_neg_batch = hedg_to_hyperedge_batch(hedg_result, hg)
-        else:
-            hyperedge_neg_batch = sample_hyperedge_negatives(
-                hg,
-                cfg=dict(neg_cfg.get("hyperedge", {})),
-                rng=epoch * 97 + len(hg.hyperedges),
-            )
+        hyperedge_neg_batch = sample_hyperedge_negatives(
+            hg,
+            cfg=dict(neg_cfg.get("hyperedge", {})),
+            rng=epoch * 97 + len(hg.hyperedges),
+        )
         neg_cache[he_cache_key] = hyperedge_neg_batch
     stats.update(hyperedge_neg_batch.meta)
     if "hyperedge_recon" in disabled or edge_emb.numel() == 0:
@@ -331,27 +305,11 @@ def compute_pretraining_losses(
     if cached_mem is not None:
         membership_neg_batch = cached_mem
     else:
-        if _USE_HEDG_NEGATIVES and _HEDG_INTEGRATION_AVAILABLE and bool(neg_cfg.get("hedg_negatives", {}).get("enabled", False)):
-            hedg_cfg = dict(neg_cfg.get("hedg_negatives", {}))
-            hedg_sampler = build_hedg_sampler(
-                hg, hedg_cfg, seed=epoch * 131 + hg.num_nodes + 1
-            )
-            # Use incident edges of each node as positive pairs
-            pos_pairs_for_hedg = []
-            for n in range(hg.num_nodes):
-                for e in (hg.incidence_matrix()[n] > 0).nonzero(as_tuple=True)[0].tolist():
-                    pos_pairs_for_hedg.append((n, e))
-            hedg_mem_result = hedg_sampler.sample_membership_negatives(
-                pos_pairs_for_hedg,
-                max_hop=int(hedg_cfg.get("max_membership_hop", 2)),
-            )
-            membership_neg_batch = hedg_to_membership_batch(hedg_mem_result)
-        else:
-            membership_neg_batch = sample_membership_negatives(
-                hg,
-                cfg=dict(neg_cfg.get("membership", {})),
-                rng=epoch * 131 + hg.num_nodes,
-            )
+        membership_neg_batch = sample_membership_negatives(
+            hg,
+            cfg=dict(neg_cfg.get("membership", {})),
+            rng=epoch * 131 + hg.num_nodes,
+        )
         neg_cache[mem_cache_key] = membership_neg_batch
     stats.update({**stats, **membership_neg_batch.meta})
     if "membership_contrast" in disabled:
