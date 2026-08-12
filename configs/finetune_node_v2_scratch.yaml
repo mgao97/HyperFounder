@@ -1,0 +1,41 @@
+# Scratch baseline matching configs/finetune_node_v2.yaml in EVERY respect
+# except pretrained_checkpoint is null. This is the fair "no pretrain"
+# baseline: same encoder, same optimizer, same data.
+#
+# Use with: python scripts/run_transfer.py --config configs/finetune_node_v2_scratch.yaml --heldout_domain <...>
+
+model:
+  input_dim: 128
+  hidden_dim: 128
+  dropout: 0.3
+  num_layers: 4
+  num_heads: 8
+  structure_pe_dim: 8
+
+training:
+  seed: 7
+  device: cuda
+  lr: 0.001
+  weight_decay: 0.0005
+  finetune_epochs: 200
+  num_seeds: 3
+  early_stopping:
+    patience: 50
+  output_dir: outputs
+  # Intentionally null — DownstreamTrainerBase.build_encoder() will use random init.
+  pretrained_checkpoint: null
+  task_name: node
+
+data:
+  datasets:
+    - cora
+    - citeseer
+    - pubmed
+  domain_map:
+    cora: citation
+    citeseer: citation
+    pubmed: citation
+  cache_dir: data/cache
+  splits:
+    train_ratio: 0.6
+    val_ratio: 0.2
