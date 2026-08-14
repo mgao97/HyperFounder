@@ -1,0 +1,144 @@
+data:
+  cache_dir: data/cache
+  datasets:
+  - cora_cc
+  - cooking_200
+  domain_map:
+    cooking_200: document
+    cora_cc: citation
+  splits:
+    train_ratio: 0.6
+    val_ratio: 0.2
+model:
+  adapter_dim: 16
+  adapter_type: adapter
+  dropout: 0.1
+  hidden_dim: 64
+  input_dim: 64
+  num_experts: 2
+  num_heads: 4
+  num_layers: 2
+  structure_pe_dim: 4
+  use_domain_adapter: true
+neg_sampling:
+  hedg_negatives:
+    enabled: true
+    fallback_to_random: true
+    hard_min_overlap: 1
+    max_membership_hop: 2
+    num_negatives: 2
+    perturbation_rate: 0.2
+    temperature: 1.0
+  hyperedge:
+    max_attempts: 5
+    min_negative_edge_size: 2
+    modes:
+    - replace
+    - overlap
+    - random
+    num_neg_per_pos: 2
+  membership:
+    max_membership_hop: 2
+    min_edges_for_node_contrastive: 1
+    min_nodes_for_node_contrastive: 4
+    num_neg_per_pos: 2
+  subgraph:
+    min_component_ratio: 0.5
+    min_incidence_density: 0.05
+    min_overlap_density: 0.05
+    num_neg_per_pos: 2
+training:
+  alignment_proj_dim: 32
+  amp:
+    dtype: bf16
+    enabled: true
+  contrastive_strategy: node_dropping
+  contrastive_temperature: 0.1
+  device: cuda
+  early_stopping:
+    patience: 100
+  edge_dropout_rate: 0.2
+  edge_num_prototypes: 8
+  enabled_tasks:
+  - masked_node
+  - hyperedge_recon
+  - contrastive
+  - size_pred
+  - domain_align
+  - membership_contrast
+  - motif
+  - community
+  - structure_align
+  - structure_discrimination
+  - orth_node
+  - orth_edge
+  - private_domain_node
+  - private_domain_edge
+  epochs: 5
+  feature_mask_rate: 0.15
+  grad_clip_norm: 1.0
+  hard_negative_bank_size: 0
+  log_interval_steps: 1
+  log_quality_stats: false
+  log_step_history: true
+  loss_weights:
+    community: 0.5
+    contrastive: 1.0
+    domain_align: 0.1
+    hyperedge_recon: 1.0
+    masked_node: 1.0
+    membership_contrast: 0.2
+    motif: 0.5
+    orth_edge: 0.02
+    orth_node: 0.02
+    private_domain_edge: 0.05
+    private_domain_node: 0.05
+    size_pred: 1.0
+    structure_align: 0.3
+    structure_discrimination: 0.3
+  lr: 0.001
+  min_masked_nodes: 2
+  min_membership_nodes: 2
+  minibatch:
+    domains_per_step: 1
+    expansion_hops: 1
+    large_graph_node_threshold: 100000
+    max_edges: 32
+    max_nodes: 64
+    seed_edges_per_subhypergraph: 1
+    subhypergraph_pool_size: 0
+    subhypergraphs_per_domain: 1
+    use_subhypergraph_pool: false
+  motif_budget: 8
+  node_num_prototypes: 8
+  num_motif_types: 4
+  num_prototypes: 4
+  output_dir: outputs_neg_sam_smoke
+  private_dim: 64
+  progress:
+    leave_progress_bar: false
+    mininterval_sec: 1.0
+    show_epoch_bar: false
+    show_pool_bar: false
+    show_step_bar: false
+  quality_min_edges: 1
+  quality_min_nodes: 2
+  seed: 7
+  shared_dim: 64
+  steps_per_epoch: 4
+  tau_edge_align: 0.65
+  tau_hard_negative: 0.4
+  tau_hyperedge: 0.55
+  tau_membership: 0.4
+  tau_motif: 0.7
+  tau_neg_low: 0.4
+  tau_node_align: 0.6
+  use_confidence_routing: true
+  use_disentanglement: true
+  use_domain_alignment: true
+  use_edge_alignment: true
+  use_hard_negative_bank: false
+  use_node_alignment: true
+  use_quality_routing: true
+  use_task_routing: false
+  weight_decay: 0.0001

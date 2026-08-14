@@ -106,24 +106,57 @@ def overlap_coefficient(incidence: torch.Tensor) -> torch.Tensor:
     return torch.nan_to_num(overlap.mean(dim=1), nan=0.0, posinf=0.0, neginf=0.0)
 
 
-def hypergraph_rw_pe(incidence: torch.Tensor, num_steps: int = 5) -> torch.Tensor:
+def hypergraph_rw_pe(incidence: torch.Tensor, num_steps: int = 5,
+                      chunk_size: int = 256) -> torch.Tensor:
+    # NOTE: previous implementation allocated three O(N^2) matrices
+    # (d_v_inv, d_e_inv, w) plus the full transition matrix, which OOMs
+    # on large hypergraphs (e.g. gowalla with 40K nodes). This version
+    # chunks the computation: it never materialises any [N, N] matrix.
+    # Memory peak per chunk is O(chunk_size * max(num_nodes, num_edges)).
     dense = _dense_incidence(incidence)
     num_nodes = dense.size(0)
+    num_edges = dense.size(1) if dense.dim() > 1 else 0
     if num_nodes == 0:
         return dense.new_zeros((0, num_steps))
+    device = dense.device
+    dtype = dense.dtype
     node_degree = dense.sum(dim=1).clamp_min(1.0)
     edge_degree = dense.sum(dim=0).clamp_min(1.0)
-    d_v_inv = torch.diag(1.0 / node_degree)
-    d_e_inv = torch.diag(1.0 / edge_degree) if edge_degree.numel() else dense.new_zeros((0, 0))
-    w = torch.eye(dense.size(1), device=dense.device, dtype=dense.dtype)
-    transition = d_v_inv @ dense @ w @ d_e_inv @ dense.transpose(0, 1)
-    transition = torch.nan_to_num(transition, nan=0.0, posinf=0.0, neginf=0.0)
-    rw_features = []
-    p_k = torch.eye(num_nodes, device=dense.device, dtype=dense.dtype)
-    for _ in range(num_steps):
-        p_k = p_k @ transition
-        rw_features.append(torch.diagonal(p_k))
-    return torch.stack(rw_features, dim=1)
+    node_degree_inv = (1.0 / node_degree).to(dtype=dtype)  # [num_nodes]
+    edge_degree_inv = (1.0 / edge_degree).to(dtype=dtype) if num_edges > 0 else None
+
+    # We compute diag(P^k) for k = 1..num_steps where
+    # P = D_v^-1 @ D @ D_e^-1 @ D^T, by iteratively multiplying a
+    # chunk of identity rows by (P). At each step we only keep the
+    # diagonal elements of that chunk.
+    rw_features = torch.zeros(num_nodes, num_steps, device=device, dtype=dtype)
+    chunk_size = max(1, min(int(chunk_size), num_nodes))
+    dense_t = dense.transpose(0, 1)  # [num_edges, num_nodes]
+
+    for cs in range(0, num_nodes, chunk_size):
+        ce = min(cs + chunk_size, num_nodes)
+        cur_chunk = ce - cs
+        chunk_idx = torch.arange(cur_chunk, device=device)
+        # cur = identity rows for this chunk  (shape: [cur_chunk, num_nodes])
+        cur = torch.zeros(cur_chunk, num_nodes, device=device, dtype=dtype)
+        cur[chunk_idx, cs + chunk_idx] = 1.0
+
+        for k in range(num_steps):
+            # cur = e_i^T @ transition = e_i^T @ D_v^-1 @ D @ D_e^-1 @ D^T
+            # Scale rows by 1/node_degree (broadcast over columns)
+            cur = cur * node_degree_inv.unsqueeze(0)
+            # cur @ D   [cur_chunk, num_edges]
+            cur = cur @ dense
+            # Scale cols by 1/edge_degree
+            if edge_degree_inv is not None:
+                cur = cur * edge_degree_inv.unsqueeze(0)
+            # cur @ D^T  [cur_chunk, num_nodes]
+            cur = cur @ dense_t
+            # Extract diagonal for this chunk
+            rw_features[cs:ce, k] = cur[chunk_idx, cs + chunk_idx]
+
+    rw_features = torch.nan_to_num(rw_features, nan=0.0, posinf=0.0, neginf=0.0)
+    return rw_features
 
 
 class CrossDomainStructuralPEModule(nn.Module):

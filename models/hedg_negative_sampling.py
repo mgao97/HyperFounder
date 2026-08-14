@@ -253,6 +253,7 @@ class HEDGNegativeSampler:
             # The "negative" is the donor's node set, possibly perturbed.
             # This is the structural-similarity-preserving negative.
             pos_list.append(int(pos_e))
+            neg_counts_per_pos.append(len(sampled))
             for donor_j, sim_w in sampled:
                 neg_list.append(int(donor_j))
                 sim_list.append(float(sim_w))

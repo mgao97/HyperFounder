@@ -55,8 +55,19 @@ with open('$TMP_CONFIG', 'w') as f: yaml.safe_dump(cfg, f)
 "
   
   LOG="$RESULTS_DIR/logs/${cfg}.log"
-  python3 -u scripts/run_pretrain_neg_sam.py \
+  # If this config has hedg_negatives.enabled, set USE_HEDG_NEGATIVES=1
+  USE_HEDG_ON=$(python3 -c "
+import yaml
+with open('$TMP_CONFIG') as f: cfg = yaml.safe_load(f)
+print(int(bool(cfg.get('neg_sampling', {}).get('hedg_negatives', {}).get('enabled', False))))
+")
+  if [[ "$USE_HEDG_ON" == "1" ]]; then
+    USE_HEDG_NEGATIVES=1 python3 -u scripts/run_pretrain_neg_sam.py \
       --config "$TMP_CONFIG" --device "$DEVICE" > "$LOG" 2>&1
+  else
+    python3 -u scripts/run_pretrain_neg_sam.py \
+      --config "$TMP_CONFIG" --device "$DEVICE" > "$LOG" 2>&1
+  fi
   
   # Extract best + final loss
   BEST=$(grep "Training finished" "$LOG" | grep -oE "best_total=[0-9.]+" | grep -oE "[0-9.]+")
