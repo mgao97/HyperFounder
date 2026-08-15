@@ -267,7 +267,7 @@ def compute_pretraining_losses(
         strategy="feature_masking",
     )
     with amp_ctx:
-        masked_node_emb, masked_edge_emb, _, masked_aux = encoder(
+        masked_node_emb, masked_edge_emb, masked_graph_emb, masked_aux = encoder(
             masked_view,
             torch.nan_to_num(masked_view.x.to(device, non_blocking=True), nan=0.0, posinf=0.0, neginf=0.0),
             motif_budget=0,
@@ -372,7 +372,7 @@ def compute_pretraining_losses(
         strategy=str(training_cfg.get("contrastive_strategy", "node_dropping")),
     )
     with amp_ctx:
-        contrastive_node_emb, contrastive_edge_emb, _, contrastive_aux = encoder(
+        contrastive_node_emb, contrastive_edge_emb, contrastive_graph_emb, contrastive_aux = encoder(
             aug_view,
             torch.nan_to_num(aug_view.x.to(device, non_blocking=True), nan=0.0, posinf=0.0, neginf=0.0),
             motif_budget=0,
@@ -463,6 +463,35 @@ def compute_pretraining_losses(
             neginf=0.0,
         )
 
+    # Structure discrimination: score original (strong) view higher than the
+    # augmented/masked (weak) views via BPR-style ranking. Acts as a regularizer
+    # that forces encoder quality-aware output magnitudes. Falls back to 0 if
+    # graph_emb tensors are empty (e.g., no valid nodes in subgraph).
+    if "structure_discrimination" in disabled:
+        losses["structure_discrimination"] = _zero(graph_emb)
+    else:
+        pos_graph = graph_emb if graph_emb.numel() > 0 else None
+        neg_masked = masked_graph_emb if masked_graph_emb.numel() > 0 else None
+        neg_contrast = contrastive_graph_emb if contrastive_graph_emb.numel() > 0 else None
+        if pos_graph is None or (neg_masked is None and neg_contrast is None):
+            losses["structure_discrimination"] = _zero(graph_emb if graph_emb.numel() > 0 else node_emb[:0])
+        else:
+            pos_graph = F.normalize(pos_graph.unsqueeze(0) if pos_graph.dim() == 1 else pos_graph, dim=-1)
+            logit_parts = []
+            if neg_masked is not None:
+                nm = F.normalize(neg_masked.unsqueeze(0) if neg_masked.dim() == 1 else neg_masked, dim=-1)
+                logit_parts.append(-F.logsigmoid((pos_graph * nm).sum(dim=-1).clamp(min=-1.0, max=1.0) * 2.0))
+            if neg_contrast is not None:
+                nc = F.normalize(neg_contrast.unsqueeze(0) if neg_contrast.dim() == 1 else neg_contrast, dim=-1)
+                logit_parts.append(-F.logsigmoid((pos_graph * nc).sum(dim=-1).clamp(min=-1.0, max=1.0) * 2.0))
+            stacked = torch.cat(logit_parts, dim=0) if len(logit_parts) > 1 else logit_parts[0]
+            losses["structure_discrimination"] = torch.nan_to_num(
+                stacked.mean(),
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            )
+
     # === NEW: Disentanglement Losses (Challenge 1) ===
     use_disentanglement = bool(training_cfg.get("use_disentanglement", False))
     if use_disentanglement and hasattr(heads, 'compute_disentanglement_losses'):
@@ -511,7 +540,10 @@ def compute_pretraining_losses(
         losses["private_domain_edge"] = _zero(graph_emb)
 
     total = _zero(graph_emb)
-    for task_name in (
+    use_uncertainty = bool(training_cfg.get("use_uncertainty_weighting", False))
+    has_uncertainty_params = use_uncertainty and hasattr(heads, "loss_log_sigmas")
+    uncertainty_stats = {}
+    task_order = (
         "masked_node",
         "hyperedge_recon",
         "contrastive",
@@ -521,11 +553,40 @@ def compute_pretraining_losses(
         "motif",
         "community",
         "structure_align",
+        "structure_discrimination",
         "orth_node",
         "orth_edge",
         "private_domain_node",
         "private_domain_edge",
-    ):
-        total = total + losses[task_name] * float(weight_map.get(task_name, 0.0))
+    )
+    if has_uncertainty_params:
+        for task_name in task_order:
+            static_w = float(weight_map.get(task_name, 0.0))
+            if static_w <= 0.0:
+                continue
+            if task_name not in losses:
+                continue
+            loss_t = losses[task_name]
+            if isinstance(loss_t, torch.Tensor):
+                if loss_t.numel() == 0:
+                    continue
+            else:
+                loss_t = torch.as_tensor(loss_t, device=graph_emb.device, dtype=graph_emb.dtype)
+            if task_name not in heads.loss_log_sigmas:
+                total = total + loss_t * static_w
+                continue
+            log_sigma = heads.loss_log_sigmas[task_name].to(loss_t.dtype).to(loss_t.device)
+            precision = torch.exp(-2.0 * log_sigma)
+            total = total + 0.5 * precision * loss_t + log_sigma
+            sigma_val = float(torch.exp(log_sigma.detach()).cpu().item())
+            uncertainty_stats[f"sigma_{task_name}"] = sigma_val
+            uncertainty_stats[f"w_{task_name}"] = float(0.5 * precision.detach().cpu().item())
+    else:
+        for task_name in task_order:
+            if task_name in losses:
+                total = total + losses[task_name] * float(weight_map.get(task_name, 0.0))
     losses["total"] = torch.nan_to_num(total, nan=0.0, posinf=0.0, neginf=0.0)
+    if uncertainty_stats:
+        for k, v in uncertainty_stats.items():
+            stats[k] = float(v)
     return {**losses, "stats": stats}

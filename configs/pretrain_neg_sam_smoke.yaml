@@ -72,6 +72,9 @@ training:
     dtype: bf16
   grad_clip_norm: 1.0
 
+  # Homoscedastic Uncertainty Weighting
+  use_uncertainty_weighting: true
+
   use_disentanglement: true
   shared_dim: 64
   private_dim: 64

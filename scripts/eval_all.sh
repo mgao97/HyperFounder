@@ -50,16 +50,20 @@ LINEAR_DATASETS="${LINEAR_DATASETS:-cora_cc cooking_200 gowalla coauthorship_dbl
 LINEAR_SEEDS="${LINEAR_SEEDS:-7 13 42}"
 LINEAR_EPOCHS="${LINEAR_EPOCHS:-100}"
 LINEAR_PATIENCE="${LINEAR_PATIENCE:-20}"
-FINETUNE_HELDOUTS="${FINETUNE_HELDOUTS:-citation academic recommendation}"
+FINETUNE_NODE_HELDOUTS="${FINETUNE_NODE_HELDOUTS:-citation academic document}"
+FINETUNE_REC_HELDOUTS="${FINETUNE_REC_HELDOUTS:-recommendation}"
 FINETUNE_SEEDS="${FINETUNE_SEEDS:-7 13 42}"
 FINETUNE_PRETRAINED_CONFIG="${FINETUNE_PRETRAINED_CONFIG:-configs/finetune_node_v2.yaml}"
 FINETUNE_SCRATCH_CONFIG="${FINETUNE_SCRATCH_CONFIG:-configs/finetune_node_v2_scratch.yaml}"
+FINETUNE_REC_PRETRAINED_CONFIG="${FINETUNE_REC_PRETRAINED_CONFIG:-configs/finetune_rec_v2.yaml}"
+FINETUNE_REC_SCRATCH_CONFIG="${FINETUNE_REC_SCRATCH_CONFIG:-configs/finetune_rec_v2_scratch.yaml}"
 BASELINE_DATASETS="${BASELINE_DATASETS:-cora citeseer pubmed}"
 BASELINE_MODELS="${BASELINE_MODELS:-hgnn hypergcn}"
 RUN_BASELINES="${RUN_BASELINES:-0}"
 
 SKIP_LINEAR="${SKIP_LINEAR:-0}"
 SKIP_FINETUNE="${SKIP_FINETUNE:-0}"
+SKIP_FINETUNE_REC="${SKIP_FINETUNE_REC:-0}"
 SKIP_BASELINES="${SKIP_BASELINES:-0}"
 SKIP_SUMMARY="${SKIP_SUMMARY:-0}"
 
@@ -140,10 +144,10 @@ else
 fi
 
 # ============================================================
-# Step 2: Full finetune — pretrained vs scratch, per held-out domain
+# Step 2: Full finetune — pretrained vs scratch, per held-out domain (node tasks)
 # ============================================================
 if [[ "$SKIP_FINETUNE" == "0" ]]; then
-  for domain in $FINETUNE_HELDOUTS; do
+  for domain in $FINETUNE_NODE_HELDOUTS; do
     # Pretrained.
     run_step "finetune_pretrained_${domain}" bash -c "
       python -u scripts/run_transfer.py \
@@ -159,6 +163,26 @@ if [[ "$SKIP_FINETUNE" == "0" ]]; then
   done
 else
   echo "[eval_all] SKIP step 'finetune' (SKIP_FINETUNE=1)"
+fi
+
+# ============================================================
+# Step 2b: Recommendation finetune (separate loop — different configs / task)
+# ============================================================
+if [[ "$SKIP_FINETUNE_REC" == "0" ]]; then
+  for domain in $FINETUNE_REC_HELDOUTS; do
+    run_step "finetune_rec_pretrained_${domain}" bash -c "
+      python -u scripts/run_transfer.py \
+        --config $FINETUNE_REC_PRETRAINED_CONFIG \
+        --heldout_domain $domain
+    "
+    run_step "finetune_rec_scratch_${domain}" bash -c "
+      python -u scripts/run_transfer.py \
+        --config $FINETUNE_REC_SCRATCH_CONFIG \
+        --heldout_domain $domain
+    "
+  done
+else
+  echo "[eval_all] SKIP step 'finetune_rec' (SKIP_FINETUNE_REC=1)"
 fi
 
 # ============================================================

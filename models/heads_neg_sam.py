@@ -338,6 +338,21 @@ class TaskHeadsNegSam(nn.Module):
                 use_edge_alignment=use_edge_alignment,
             )
 
+        # === NEW: Homoscedastic Uncertainty Weighting (Kendall et al., CVPR 2018)
+        # Replaces hand-tuned loss_weights with learned per-task precision.
+        # For each task i we store a learnable log_sigma_i, initialized to 0.
+        # The effective weight becomes: loss_i / (2 * exp(2 * log_sigma_i)) + log_sigma_i.
+        uncertainty_task_names = [
+            "masked_node", "hyperedge_recon", "contrastive", "size_pred",
+            "domain_align", "membership_contrast", "motif", "community",
+            "structure_align", "structure_discrimination",
+            "orth_node", "orth_edge", "private_domain_node", "private_domain_edge",
+        ]
+        self.loss_log_sigmas = nn.ParameterDict({
+            name: nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
+            for name in uncertainty_task_names
+        })
+
     def compute_disentanglement_losses(
         self,
         z_node_shared: torch.Tensor,

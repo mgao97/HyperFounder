@@ -70,6 +70,18 @@ training:
     use_subhypergraph_pool: true
     subhypergraph_pool_size: 64  # Reduced from 512 for faster pool building
     large_graph_node_threshold: 5000
+
+  # Mixed precision: bf16 on Ampere+ for stability + 2-3x throughput on RTX 4090.
+  amp:
+    enabled: true
+    dtype: bf16
+  grad_clip_norm: 1.0
+
+  # Homoscedastic Uncertainty Weighting (Kendall et al. CVPR 2018)
+  # When enabled, static loss_weights become master on/off switches and the
+  # per-task effective weight is learned end-to-end via log_sigma parameters
+  # stored in TaskHeadsNegSam.loss_log_sigmas.
+  use_uncertainty_weighting: true
   
   # === Challenge 1: Cross-Domain Disentanglement & Alignment ===
   # Shared-Private Disentanglement

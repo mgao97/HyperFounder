@@ -24,7 +24,7 @@ training:
     max_edges: 8
     expansion_hops: 1
   output_dir: outputs
-  pretrained_checkpoint: outputs/checkpoints/pretrain_last.pt
+  pretrained_checkpoint: outputs_neg_sam_hedg/checkpoints/pretrain_best_neg_sam.pt
   task_name: rec
 
 data:

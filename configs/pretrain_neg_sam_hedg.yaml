@@ -32,6 +32,7 @@ training:
     - hyperedge_recon
     - contrastive
     - domain_align
+    - membership_contrast
     - orth_node
     - orth_edge
     - private_domain_node
@@ -69,11 +70,15 @@ training:
     subhypergraph_pool_size: 0
     large_graph_node_threshold: 100000
 
-  # Mixed precision (CPU-safe: disabled here)
+  # Mixed precision: bf16 by default (Ampere+ GPUs; CPU still disables autocast
+  # in the trainer via the cuda availability check, so this is safe).
   amp:
-    enabled: false
+    enabled: true
     dtype: bf16
   grad_clip_norm: 1.0
+
+  # Homoscedastic Uncertainty Weighting
+  use_uncertainty_weighting: true
 
   use_disentanglement: true
   shared_dim: 64

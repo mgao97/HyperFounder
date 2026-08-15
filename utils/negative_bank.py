@@ -69,33 +69,47 @@ class HardNegativeBank:
         subhypergraph_data: dict,
         quality_score: float,
         domain_id: int,
+        hedg_meta: dict | None = None,
     ) -> bool:
         """
         Add a sub-hypergraph to the bank.
-        
+
         Args:
             subhypergraph_data: Dictionary containing subhypergraph info
-            quality_score: Quality score [0, 1]
+            quality_score: Quality score [0, 1] (higher = structurally richer)
             domain_id: Domain identifier
-        
+            hedg_meta: Optional HEDG-level metadata for negatives from the
+                HEDG-weighted sampler, e.g. ``{"avg_similarity": float,
+                "fallback_rate": float, "num_negatives": int}``.
+
         Returns:
             True if added, False if rejected
         """
         tier = self._get_tier(quality_score)
-        
+
         if domain_id >= self.num_domains:
             domain_id = 0
-        
+
+        hedg_meta = hedg_meta or {}
+        hedg_avg_sim = float(hedg_meta.get("avg_similarity", 0.0))
+        hedg_fallback = float(hedg_meta.get("fallback_rate", 0.0))
+        # Combined "hardness" proxy: 1 - quality (low quality = hard)
+        # boosted if HEDG similarity is high (high overlap = hard negatives).
+        hardness_proxy = (1.0 - quality_score) + 0.5 * min(hedg_avg_sim / max(hedg_avg_sim + hedg_fallback + 1e-6, 1.0), 1.0)
         entry = {
             "data": subhypergraph_data,
             "quality_score": quality_score,
             "domain_id": domain_id,
             "tier": tier,
+            "hedg_avg_similarity": hedg_avg_sim,
+            "hedg_fallback_rate": hedg_fallback,
+            "hardness_proxy": float(max(0.0, min(1.0, hardness_proxy))),
+            "hedg_meta": hedg_meta,
         }
-        
+
         self.bank[tier][domain_id].append(entry)
         self._trim()
-        
+
         return True
 
     def _trim(self):
@@ -191,24 +205,31 @@ class HardNegativeBank:
         min_quality: Optional[float],
         max_quality: Optional[float],
     ) -> List[dict]:
-        """Sample with quality-weighted probability."""
+        """Sample with quality-weighted probability.
+
+        Combines (a) inverse-quality (low quality = harder) and
+        (b) HEDG hardness proxy (high HEDG similarity = harder) into
+        a single sampling weight so that the bank naturally favours
+        subgraphs that produced the most informative negatives.
+        """
         candidates = self._collect_candidates(domain_id, min_quality, max_quality)
-        
+
         if len(candidates) <= batch_size:
             return [c[0] for c in candidates]
-        
-        # Weight by inverse quality (prefer lower quality for hard negatives)
+
         weights = []
         for entry, tier, domain in candidates:
-            # Lower tier = higher weight for hard negatives
-            weight = 1.0 / (entry["quality_score"] + 0.1)
-            # Boost by tier (lower tier preferred)
-            weight *= (self.num_tiers - tier) / self.num_tiers
-            weights.append(weight)
-        
+            hardness = float(entry.get("hardness_proxy", 0.0))
+            q = float(entry.get("quality_score", 0.5))
+            # Base inverse quality (as before)
+            base = 1.0 / (q + 0.1)
+            tier_boost = (self.num_tiers - tier) / self.num_tiers
+            hedg_boost = 1.0 + hardness
+            weights.append(base * tier_boost * hedg_boost)
+
         total_weight = sum(weights)
         probs = [w / total_weight for w in weights]
-        
+
         selected = random.choices(candidates, weights=probs, k=batch_size)
         return [c[0] for c in selected]
 
@@ -228,26 +249,38 @@ class HardNegativeBank:
         total = 0
         by_tier = {}
         quality_sum = 0.0
-        
+        hedg_sim_sum = 0.0
+        hardness_sum = 0.0
+        fallback_sum = 0.0
+
         for tier in range(self.num_tiers):
             tier_count = 0
             for domain in range(self.num_domains):
                 tier_count += len(self.bank[tier][domain])
                 total += len(self.bank[tier][domain])
             by_tier[f"tier_{tier}"] = tier_count
-        
+
         for tier in range(self.num_tiers):
             for domain in range(self.num_domains):
                 for entry in self.bank[tier][domain]:
                     quality_sum += entry["quality_score"]
-        
+                    hedg_sim_sum += float(entry.get("hedg_avg_similarity", 0.0))
+                    hardness_sum += float(entry.get("hardness_proxy", 0.0))
+                    fallback_sum += float(entry.get("hedg_fallback_rate", 0.0))
+
         avg_quality = quality_sum / max(total, 1)
-        
+        avg_hedg_sim = hedg_sim_sum / max(total, 1)
+        avg_hardness = hardness_sum / max(total, 1)
+        avg_fallback = fallback_sum / max(total, 1)
+
         return {
             "total_size": total,
             "max_size": self.max_size,
             "utilization": total / max(self.max_size, 1),
             "avg_quality": avg_quality,
+            "avg_hedg_similarity": avg_hedg_sim,
+            "avg_hardness_proxy": avg_hardness,
+            "avg_hedg_fallback_rate": avg_fallback,
             **by_tier,
         }
 

@@ -124,12 +124,24 @@ class PretrainTrainerNegSam(TrainerBase):
             lr=float(config["training"]["lr"]),
             weight_decay=float(config["training"]["weight_decay"]),
         )
-        # Mixed precision (bf16 on Ampere+, fp16 fallback) for 2-3x throughput on RTX 4090.
+        # Mixed precision: prefer bf16 (stable, no GradScaler needed) over fp16.
+        # When CUDA is unavailable we disable AMP entirely (CPU autocast is slow).
         amp_cfg = config.get("training", {}).get("amp", {})
-        self.use_amp = bool(amp_cfg.get("enabled", True)) and torch.cuda.is_available()
+        cuda_available = torch.cuda.is_available()
+        self.use_amp = bool(amp_cfg.get("enabled", True)) and cuda_available
         amp_dtype = str(amp_cfg.get("dtype", "bf16")).lower()
         self.amp_dtype = torch.bfloat16 if amp_dtype == "bf16" else torch.float16
-        self.scaler = GradScaler("cuda", enabled=self.use_amp and self.amp_dtype is torch.float16)
+        # GradScaler is only meaningful for fp16; bf16 has sufficient
+        # dynamic range that scaling is unnecessary (Kendall et al.).
+        self.scaler = GradScaler(
+            "cuda",
+            enabled=self.use_amp and self.amp_dtype is torch.float16,
+        )
+        if self.use_amp:
+            self._log(
+                f"Mixed precision enabled: dtype={'bf16' if self.amp_dtype is torch.bfloat16 else 'fp16'} "
+                f"(GradScaler enabled={self.scaler.is_enabled()})"
+            )
         self.grad_clip_norm = float(config["training"].get("grad_clip_norm", 1.0))
         self.minibatch_config = dict(config.get("training", {}).get("minibatch", {}))
         self._log("Stage 3/4: building subhypergraph pools")
@@ -137,7 +149,8 @@ class PretrainTrainerNegSam(TrainerBase):
         self.domain_sample_counts = {name: 0 for name in self.domains}
         self.training_datasets = sorted({graph.dataset_name for graph in self.graphs})
         
-        # Challenge 2: Hard Negative Bank
+        # Challenge 2: Hard Negative Bank (now with HEDG-similarity-aware
+        # entry scoring + optional replay of historically hard subgraphs.)
         training_cfg = config.get("training", {})
         self.use_hard_negative_bank = bool(training_cfg.get("use_hard_negative_bank", True))
         self.log_quality_stats = bool(training_cfg.get("log_quality_stats", True))
@@ -148,9 +161,26 @@ class PretrainTrainerNegSam(TrainerBase):
                 num_domains=len(self.training_domains),
                 sampling_strategy=str(training_cfg.get("hard_negative_sampling_strategy", "quality_weighted")),
             )
-            self._log(f"Initialized HardNegativeBank: size={self.hard_negative_bank.max_size}")
+            self.hard_negative_replay_enabled = bool(
+                training_cfg.get("hard_negative_replay_enabled", True)
+            )
+            self.hard_negative_replay_interval = int(
+                training_cfg.get("hard_negative_replay_interval", 5)
+            )
+            self.hard_negative_replay_fraction = float(
+                training_cfg.get("hard_negative_replay_fraction", 0.2)
+            )
+            self._log(
+                f"Initialized HardNegativeBank: size={self.hard_negative_bank.max_size} "
+                f"replay={'on' if self.hard_negative_replay_enabled else 'off'} "
+                f"(every {self.hard_negative_replay_interval} steps, "
+                f"{int(self.hard_negative_replay_fraction * 100)}% batch)"
+            )
         else:
             self.hard_negative_bank = None
+            self.hard_negative_replay_enabled = False
+            self.hard_negative_replay_interval = 0
+            self.hard_negative_replay_fraction = 0.0
         
         self._log_startup_info()
 
@@ -473,18 +503,85 @@ class PretrainTrainerNegSam(TrainerBase):
                     }
                     batch_quality_stats.append(quality_stats)
                     
-                    # Add to hard negative bank if applicable
+                    # Add to hard negative bank if applicable.
+                    # HEDG-level metadata (avg similarity, fallback rate, ...)
+                    # is bundled together with the structural quality score
+                    # so the quality_weighted sampler naturally favours
+                    # subgraphs that historically produced the hardest, most
+                    # structurally similar negatives.
                     if self.hard_negative_bank is not None and routing["hard_negative"]:
+                        per_graph_stats = batch_stats[-1] if batch_stats else {}
+                        n_hard = float(per_graph_stats.get("n_hard_used", 0.0))
+                        n_fb = float(per_graph_stats.get("n_random_fallback", 0.0))
+                        fallback_rate = (n_fb / max(n_hard + n_fb, 1e-6)) if (n_hard + n_fb) > 0 else 0.0
+                        hedg_meta = {
+                            "avg_similarity": float(per_graph_stats.get("avg_neg_hedg_similarity", 0.0)),
+                            "fallback_rate": fallback_rate,
+                            "n_hard_used": n_hard,
+                            "n_random_fallback": n_fb,
+                        }
                         self.hard_negative_bank.add(
                             subhypergraph_data={"name": hg.name, "domain": hg.domain},
                             quality_score=quality_meta.quality_score,
                             domain_id=quality_meta.domain_id,
+                            hedg_meta=hedg_meta,
                         )
-                
+
+                # === Optional replay: re-forward on historically-hard subgraphs. ===
+                # Pull replay_fraction * batch_size entries from the bank, find
+                # the matching pooled subhypergraphs by name in pool_cache, and
+                # append their loss to step_loss. Missing entries are skipped.
+                replay_loss_acc = None
+                replay_count = 0
+                if (
+                    self.hard_negative_bank is not None
+                    and self.hard_negative_replay_enabled
+                    and (step + 1) % self.hard_negative_replay_interval == 0
+                ):
+                    replay_target = max(1, int(self.hard_negative_replay_fraction * len(batch_graphs)))
+                    bank_entries = self.hard_negative_bank.sample(replay_target)
+                    replay_hgs: List = []
+                    for entry in bank_entries:
+                        data = entry.get("data", {})
+                        name = data.get("name")
+                        domain = data.get("domain")
+                        if not name or not domain:
+                            continue
+                        pool_list = self.pool_cache.get(name)
+                        if pool_list:
+                            replay_hgs.append(pool_list[0])
+                    if replay_hgs:
+                        replay_totals = []
+                        for r_hg in replay_hgs:
+                            r_hg.metadata["domain_id"] = (
+                                self.training_domains.index(r_hg.domain)
+                                if r_hg.domain in self.training_domains else 0
+                            )
+                            r_loss = compute_pretraining_losses(
+                                encoder=self.encoder,
+                                heads=self.heads,
+                                hg=r_hg,
+                                task_cache={},
+                                config=self.config,
+                                device=self.device,
+                                epoch=epoch,
+                                drop_tasks=self.drop_tasks,
+                                amp_enabled=self.use_amp,
+                                amp_dtype=self.amp_dtype,
+                            )
+                            r_t = r_loss.get("total")
+                            if isinstance(r_t, torch.Tensor) and r_t.numel() == 1:
+                                replay_totals.append(r_t)
+                        if replay_totals:
+                            replay_loss_acc = torch.stack(replay_totals).mean()
+                            replay_count = len(replay_totals)
+
                 # === CRITICAL FIX: actually backprop and step the optimizer. ===
                 # Without this the model is never updated and losses never decrease.
                 if per_graph_total:
                     step_loss = torch.stack(per_graph_total).mean()
+                    if replay_loss_acc is not None:
+                        step_loss = step_loss + self.hard_negative_replay_fraction * replay_loss_acc
                     if self.use_amp and self.scaler is not None:
                         self.scaler.scale(step_loss).backward()
                         self.scaler.unscale_(self.optimizer)
@@ -549,6 +646,18 @@ class PretrainTrainerNegSam(TrainerBase):
                 for key in epoch_stats:
                     epoch_stats[key] += averaged_stats.get(key, 0.0)
                 if step == 0 or (step + 1) % log_interval_steps == 0 or step + 1 == steps_per_epoch:
+                    extra_log_parts: List[str] = []
+                    if replay_count > 0:
+                        extra_log_parts.append(f"replay_n={replay_count}")
+                    if self.log_quality_stats and self.hard_negative_bank is not None:
+                        bstats = self.hard_negative_bank.get_stats()
+                        extra_log_parts.append(
+                            f"bank_size={int(bstats['total_size'])}/{bstats['max_size']:.0f} "
+                            f"bank_q={bstats['avg_quality']:.3f} "
+                            f"bank_hardness={bstats.get('avg_hardness_proxy', 0.0):.3f} "
+                            f"bank_hedg_sim={bstats.get('avg_hedg_similarity', 0.0):.2f}"
+                        )
+                    extra = (" | " + " | ".join(extra_log_parts)) if extra_log_parts else ""
                     self._log(
                         f"Epoch {epoch}/{epochs} step {step + 1}/{steps_per_epoch}: "
                         f"preferred_domains={','.join(step_domains) if step_domains else '-'} "
@@ -565,7 +674,8 @@ class PretrainTrainerNegSam(TrainerBase):
                         f"neg_hyperedges={averaged_stats.get('num_hyperedge_negatives', 0.0):.1f} "
                         f"neg_memberships={averaged_stats.get('num_membership_negatives', 0.0):.1f} "
                         f"avg_neg_overlap={averaged_stats.get('avg_negative_overlap', 0.0):.2f} "
-                        f"avg_membership_hop={averaged_stats.get('avg_membership_hop', 0.0):.2f} "
+                        f"avg_membership_hop={averaged_stats.get('avg_membership_hop', 0.0):.2f}"
+                        f"{extra} "
                         f"batch_graphs=[{self._describe_batch_graphs(batch_graphs)}]"
                     )
             if step_bar is not None:
