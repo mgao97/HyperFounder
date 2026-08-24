@@ -84,51 +84,68 @@ class NodeConfidenceScorer(nn.Module):
             )
         degree_score = (node_degrees / max(node_degrees.max().item(), 1.0)).clamp(0, 1).to(device)
 
-        # Overlap score: for each node, count shared nodes across all pairs of
-        # its incident hyperedges. Computed from the sparse COO structure only
-        # (no dense materialisation), so it is safe on large hypergraphs.
+        # Overlap score: for each node i, sum over co-member nodes u of
+        # C(co[i,u], 2) where co[i,u] = #edges containing both i and u. This is
+        # exactly the pairwise edge-intersection semantics of the original
+        # O(N*k^2) Python loop, but computed WITHOUT any Python iteration over
+        # node pairs and WITHOUT dense materialisation.
+        #
+        # We build the node-node co-membership as a sparse COO tensor by
+        # enumerating unordered node pairs per edge (each edge of size k_e
+        # contributes C(k_e,2) pairs; small for real hypergraphs). A coalesced
+        # sparse tensor then sums duplicate (i,u) entries into co[i,u]. This
+        # avoids torch.sparse.mm (which is unstable on CPU and OOM-prone on
+        # GPU for dense-ish inputs) and the original set-intersection loop.
+        # Hyperedges larger than MAX_PAIR_MEMBERS are skipped — their
+        # contribution to pairwise overlap is negligible and this bounds work.
         overlap_score = torch.zeros(num_nodes, device=device)
         if col.numel() > 0:
-            # Build edge -> member-nodes mapping once (sort by edge id).
+            MAX_PAIR_MEMBERS = 2048
             e_order = torch.argsort(col, stable=True)
             col_e, row_e = col[e_order], row[e_order]
-            num_edges_local = int(col.max().item()) + 1
-            _, e_counts = torch.unique_consecutive(col_e, return_counts=True)
-            e_offsets = torch.cat([
+            uniq_e, e_counts = torch.unique_consecutive(col_e, return_counts=True)
+            # e_start[j] / e_start[j+1] delimit the member range of edge uniq_e[j]
+            e_start = torch.cat([
                 torch.zeros(1, dtype=torch.long, device=device), e_counts.cumsum(0)
             ])
-            # Cache member sets per edge to avoid re-scanning.
-            edge_members_cache = {}
-            def get_members(e):
-                if e not in edge_members_cache:
-                    st, en = int(e_offsets[e]), int(e_offsets[e + 1])
-                    edge_members_cache[e] = set(row_e[st:en].tolist())
-                return edge_members_cache[e]
-
-            # Node -> incident edges mapping (sort by node id).
-            order = torch.argsort(row, stable=True)
-            row_s, col_s = row[order], col[order]
-            _, counts = torch.unique_consecutive(row_s, return_counts=True)
-            offsets = torch.cat([torch.zeros(1, dtype=torch.long, device=device), counts.cumsum(0)])
-
-            for i in range(num_nodes):
-                if i >= offsets.size(0) - 1:
+            src_list, dst_list = [], []
+            triu_cache = {}
+            for j in range(uniq_e.numel()):
+                st, en = int(e_start[j]), int(e_start[j + 1])
+                k = en - st
+                if k < 2 or k > MAX_PAIR_MEMBERS:
                     continue
-                start, end = int(offsets[i]), int(offsets[i + 1])
-                k = end - start
-                if k < 2:
-                    continue
-                inc_edges = col_s[start:end].tolist()
-                shared_count = 0
-                for a in range(k):
-                    ma = get_members(inc_edges[a])
-                    if not ma:
-                        continue
-                    for b in range(a + 1, k):
-                        shared_count += len(ma & get_members(inc_edges[b]))
-                denom = max(k * (k - 1) // 2, 1)
-                overlap_score[i] = shared_count / denom
-            overlap_score = overlap_score.clamp(0, 1)
+                m = row_e[st:en]
+                triu = triu_cache.get(k)
+                if triu is None:
+                    triu = torch.triu(
+                        torch.ones(k, k, dtype=torch.bool, device=device), diagonal=1
+                    )
+                    triu_cache[k] = triu
+                pairs_i = m.unsqueeze(0).expand(k, k)[triu]
+                pairs_j = m.unsqueeze(1).expand(k, k)[triu]
+                src_list.append(pairs_i)
+                dst_list.append(pairs_j)
+                src_list.append(pairs_j)  # symmetric: co[i,u] == co[u,i]
+                dst_list.append(pairs_i)
+            if src_list:
+                src = torch.cat(src_list)
+                dst = torch.cat(dst_list)
+                co = torch.sparse_coo_tensor(
+                    torch.stack([src, dst]),
+                    torch.ones(src.numel(), device=device),
+                    (num_nodes, num_nodes),
+                ).coalesce()
+                cidx = co.indices()
+                cval = co.values().float()
+                comb = cval * (cval - 1.0) / 2.0  # C(v, 2)
+                raw = torch.zeros(num_nodes, device=device).index_add(0, cidx[0], comb)
+                # Diagonal term: node i participates in its own edge intersections
+                # (|M(e1) ∩ M(e2)| includes i itself), equivalent to co[i,i] = deg_i.
+                deg_i = node_degrees.long().clamp(min=0)
+                raw = raw + (deg_i * (deg_i - 1) // 2).float()  # C(deg_i, 2)
+                denom = (deg_i * (deg_i - 1) // 2).clamp(min=1).float()
+                overlap_score = (raw / denom).clamp(0, 1)
 
         # Validity score: node should have at least some connections
         validity_score = (node_degrees > 0).float().to(device)
@@ -244,40 +261,60 @@ class EdgeConfidenceScorer(nn.Module):
         num_edges = edge_emb.size(0)
         confidence = torch.zeros(num_edges, device=edge_emb.device)
 
-        # Edge -> member count (cardinality) from sparse COO.
+        # Edge -> member count (cardinality) from sparse COO. Length is
+        # num_edges (not max edge id) so empty/sparse edge ids can't overflow.
+        edge_card = torch.zeros(num_edges, dtype=torch.long, device=device)
         if col.numel() > 0:
-            num_e_local = int(col.max().item()) + 1
-            edge_card = torch.zeros(num_e_local, dtype=torch.long, device=device).index_add(
-                0, col, torch.ones(col.numel(), dtype=torch.long, device=device)
+            edge_card = edge_card.index_add(
+                0, col.clamp(max=num_edges - 1), torch.ones(col.numel(), dtype=torch.long, device=device)
             )
-        else:
-            edge_card = torch.zeros(num_edges, dtype=torch.long, device=device)
 
-        # Overlap score: count, for each edge, how many *other* edges share at
-        # least one node. Aggregated via node incidence (no dense materialisation,
-        # no O(E^2) Python loop).
+        # Overlap score: for each edge e, count how many *other* edges share at
+        # least one node with e (de-duplicated), normalised by (num_edges - 1).
+        # This is exactly the semantics of the original O(E^2) loop
+        # (`for e_idx, for other_idx: if share a node -> overlap_count += 1`)
+        # but computed via a sparse shared-edge matrix (no Python loop, no set
+        # ops, no dense materialisation). Edges sharing >=1 node get clamped 0/1.
         overlap_share = torch.zeros(num_edges, device=device)
         if col.numel() > 0:
-            e_order = torch.argsort(row, stable=True)
-            row_e, col_e = row[e_order], col[e_order]
-            _, n_counts = torch.unique_consecutive(row_e, return_counts=True)
-            e_offsets = torch.cat([
+            n_order = torch.argsort(row, stable=True)
+            row_n, col_n = row[n_order], col[n_order]
+            uniq_n, n_counts = torch.unique_consecutive(row_n, return_counts=True)
+            n_start = torch.cat([
                 torch.zeros(1, dtype=torch.long, device=device), n_counts.cumsum(0)
             ])
-            for n in range(row.max().item() + 1):
-                if n >= e_offsets.size(0) - 1:
+            src_list, dst_list = [], []
+            comb_cache = {}
+            for j in range(uniq_n.numel()):
+                st, en = int(n_start[j]), int(n_start[j + 1])
+                k = en - st
+                if k < 2:
                     continue
-                st, en = int(e_offsets[n]), int(e_offsets[n + 1])
-                if en - st < 2:
-                    continue
-                inc = col_e[st:en]
-                # every edge in `inc` shares node n with every other edge in `inc`
-                for a in range(inc.numel()):
-                    share_a = (inc != inc[a]).sum().item()  # number of other edges sharing n
-                    overlap_share[inc[a]] += share_a
-            # normalise by number of possible other edges
-            denom = max(num_edges - 1, 1)
-            overlap_share = (overlap_share.clamp(0, denom) / denom)
+                m = col_n[st:en]  # incident edges of this node
+                triu = comb_cache.get(k)
+                if triu is None:
+                    triu = torch.triu(
+                        torch.ones(k, k, dtype=torch.bool, device=device), diagonal=1
+                    )
+                    comb_cache[k] = triu
+                a = m.unsqueeze(0).expand(k, k)[triu]
+                b = m.unsqueeze(1).expand(k, k)[triu]
+                src_list += [a, b]
+                dst_list += [b, a]
+            if src_list:
+                src = torch.cat(src_list)
+                dst = torch.cat(dst_list)
+                share = torch.sparse_coo_tensor(
+                    torch.stack([src, dst]),
+                    torch.ones(src.numel(), device=device),
+                    (num_edges, num_edges),
+                ).coalesce()
+                sv = share.values().clamp(max=1).float()  # 0/1: shares a node or not
+                overlap_share = torch.zeros(num_edges, device=device).index_add(
+                    0, share.indices()[0], sv
+                )
+                denom = max(num_edges - 1, 1)
+                overlap_share = (overlap_share.clamp(0, denom) / denom)
 
         cardinality = edge_card[:num_edges].tolist()
         for e_idx in range(num_edges):

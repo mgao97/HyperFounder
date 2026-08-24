@@ -44,26 +44,59 @@ def sample_motifs(hg: SimpleHypergraph, budget: int, seed: int) -> List[Dict[str
 
 def sample_communities(hg: SimpleHypergraph) -> List[Dict[str, List[int]]]:
     incidence = hg.incidence_matrix()
-    overlap = incidence @ incidence.transpose(0, 1)
-    if overlap.numel() == 0:
+    if incidence.numel() == 0 or hg.num_nodes == 0:
         return []
+    N = hg.num_nodes
+    device = incidence.device
+    sparse_inc = incidence.to_sparse_coo().coalesce() if not incidence.is_sparse else incidence.coalesce()
+    node_idx, edge_idx = sparse_inc.indices()
+
+    # Strong co-membership adjacency (overlap >= avg_degree). For small graphs a
+    # dense N x N overlap is fine; for large graphs use a *sparse* overlap so we
+    # never materialise an N x N dense matrix (which OOMs, e.g. on DBLP).
+    if N <= 12000:
+        inc_dense = incidence.to_dense()
+        overlap = (inc_dense @ inc_dense.t()).float()
+        avg_degree = float(inc_dense.sum(dim=1).mean().item())
+        threshold = max(1.0, avg_degree)
+        adj = overlap >= threshold  # [N, N] bool dense
+        a = b = None
+    else:
+        # Sparse overlap for large graphs. Force float32 + disable autocast:
+        # autocast(bf16) would cast the sparse inputs to BFloat16, which CUDA
+        # sparse kernels reject, and the incidence may already be BFloat16.
+        with torch.autocast(device_type=device.type, enabled=False):
+            ov_fp32 = torch.sparse_coo_tensor(
+                sparse_inc.indices(), sparse_inc.values().float(), sparse_inc.size())
+            overlap_s = torch.sparse.mm(ov_fp32, ov_fp32.transpose(0, 1)).coalesce()
+        avg_degree = float(sparse_inc.sum(dim=1).values().mean().item())
+        threshold = max(1.0, avg_degree)
+        ov_idx = overlap_s.indices()
+        ov_mask = overlap_s.values().float() >= threshold
+        a = ov_idx[0][ov_mask]
+        b = ov_idx[1][ov_mask]
+        adj = None
+
     communities: List[Dict[str, List[int]]] = []
-    visited = set()
-    avg_degree = float(incidence.sum(dim=1).mean().item()) if hg.num_nodes else 0.0
-    threshold = max(1.0, avg_degree)
-    for node_index in range(hg.num_nodes):
-        if node_index in visited:
-            continue
-        members = torch.where(overlap[node_index] >= threshold)[0].tolist()
-        if not members:
-            members = [node_index]
-        visited.update(members)
-        edge_ids = []
-        member_set = set(members)
-        for edge_index, edge in enumerate(hg.hyperedges):
-            if member_set.intersection(edge):
-                edge_ids.append(edge_index)
-        communities.append({"nodes": sorted(member_set), "edges": edge_ids})
+    visited = torch.zeros(N, dtype=torch.bool, device=device)
+    remaining = ~visited
+    # Outer loop runs once per *community* (not per node); all inner work is
+    # vectorised (no O(E) Python set intersection, no N x N dense scan).
+    while remaining.any():
+        seed = int(torch.nonzero(remaining, as_tuple=False)[0].item())
+        if adj is not None:
+            members = torch.nonzero(adj[seed]).view(-1)
+        else:
+            row_mask = a == seed
+            members = torch.unique(torch.cat([b[row_mask], a[row_mask], torch.tensor([seed], device=device)]))
+        if members.numel() == 0:
+            members = torch.tensor([seed], device=device)
+        # Edges intersecting the community: edges that have any member node.
+        member_mask = torch.isin(node_idx, members)
+        edge_ids = torch.unique(edge_idx[member_mask]).tolist()
+        communities.append({"nodes": members.tolist(), "edges": edge_ids})
+        visited[members] = True
+        remaining = ~visited
     return communities
 
 
