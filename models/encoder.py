@@ -107,7 +107,15 @@ class UnifiedHypergraphEncoder(nn.Module):
         if isinstance(hg, HypergraphData):
             data = hg
             feature_tensor = hg.node_features
-            incidence_dense = hg.incidence_matrix.to_dense() if hg.incidence_matrix.is_sparse else hg.incidence_matrix
+            # Keep the incidence matrix sparse — materialising a [N, E] dense
+            # matrix for large hypergraphs (e.g. coauthorship_dblp: ~49860 x E)
+            # OOMs the GPU. Downstream consumers that need a dense view call
+            # .to_dense() lazily on the CPU/small graphs.
+            incidence_dense = (
+                hg.incidence_matrix.to_sparse_coo()
+                if hg.incidence_matrix.is_sparse
+                else hg.incidence_matrix
+            )
             domain_name = str(hg.domain_id)
             domain_id = int(hg.domain_id)
             edge_features = hg.edge_features

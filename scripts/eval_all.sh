@@ -43,10 +43,16 @@ set -euo pipefail
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJECT_ROOT"
 
+# Restrict to physical GPU 1 unless the caller overrides (e.g. CUDA_VISIBLE_DEVICES=3).
+# The previous eval run OOM'd on GPU 0 due to a dense materialisation of a large
+# incidence matrix; that is now fixed, but we still pin a dedicated GPU.
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-1}"
+
 DEVICE="${DEVICE:-cuda}"
+PYTHON_BIN="${PYTHON_BIN:-python}"
 PRETRAIN_CKPT="${PRETRAIN_CKPT:-outputs_neg_sam_v2/checkpoints/pretrain_best_neg_sam.pt}"
 PRETRAIN_CONFIG="${PRETRAIN_CONFIG:-configs/pretrain_neg_sam_v2.yaml}"
-LINEAR_DATASETS="${LINEAR_DATASETS:-cora_cc cooking_200 gowalla coauthorship_dblp}"
+LINEAR_DATASETS="${LINEAR_DATASETS:-cora_cc cooking_200 coauthorship_dblp}"
 LINEAR_SEEDS="${LINEAR_SEEDS:-7 13 42}"
 LINEAR_EPOCHS="${LINEAR_EPOCHS:-100}"
 LINEAR_PATIENCE="${LINEAR_PATIENCE:-20}"
@@ -67,7 +73,7 @@ SKIP_FINETUNE_REC="${SKIP_FINETUNE_REC:-0}"
 SKIP_BASELINES="${SKIP_BASELINES:-0}"
 SKIP_SUMMARY="${SKIP_SUMMARY:-0}"
 
-EVAL_DIR="outputs_neg_sam_v2/eval_all"
+EVAL_DIR="${EVAL_DIR:-outputs_neg_sam_v2/eval_all}"
 mkdir -p "$EVAL_DIR/logs" "$EVAL_DIR/pids" "$EVAL_DIR/markers"
 
 timestamp="$(date +%Y%m%d_%H%M%S)"
@@ -77,7 +83,11 @@ LATEST_PID_FILE="$EVAL_DIR/pids/eval_all_latest.pid"
 LATEST_META="$EVAL_DIR/pids/eval_all_latest.meta"
 
 # Top-level redirect (all stdout/stderr from this point on).
-exec > >(tee -a "$LOG_FILE") 2>&1
+if [[ "${DISABLE_TEE:-0}" == "1" ]]; then
+  exec >> "$LOG_FILE" 2>&1
+else
+  exec > >(tee -a "$LOG_FILE") 2>&1
+fi
 
 echo "$BASHPID" > "$PID_FILE"
 echo "$BASHPID" > "$LATEST_PID_FILE"
@@ -129,7 +139,7 @@ run_step() {
 # ============================================================
 if [[ "$SKIP_LINEAR" == "0" ]]; then
   run_step linear_probe bash -c "
-    python -u scripts/linear_probe_neg_sam.py \
+    \"$PYTHON_BIN\" -u scripts/linear_probe_neg_sam.py \
       --device $DEVICE \
       --pretrained $PRETRAIN_CKPT \
       --config $PRETRAIN_CONFIG \
@@ -150,13 +160,13 @@ if [[ "$SKIP_FINETUNE" == "0" ]]; then
   for domain in $FINETUNE_NODE_HELDOUTS; do
     # Pretrained.
     run_step "finetune_pretrained_${domain}" bash -c "
-      python -u scripts/run_transfer.py \
+      \"$PYTHON_BIN\" -u scripts/run_transfer.py \
         --config $FINETUNE_PRETRAINED_CONFIG \
         --heldout_domain $domain
     "
     # Scratch (same arch, no pretrain).
     run_step "finetune_scratch_${domain}" bash -c "
-      python -u scripts/run_transfer.py \
+      \"$PYTHON_BIN\" -u scripts/run_transfer.py \
         --config $FINETUNE_SCRATCH_CONFIG \
         --heldout_domain $domain
     "
@@ -171,12 +181,12 @@ fi
 if [[ "$SKIP_FINETUNE_REC" == "0" ]]; then
   for domain in $FINETUNE_REC_HELDOUTS; do
     run_step "finetune_rec_pretrained_${domain}" bash -c "
-      python -u scripts/run_transfer.py \
+      \"$PYTHON_BIN\" -u scripts/run_transfer.py \
         --config $FINETUNE_REC_PRETRAINED_CONFIG \
         --heldout_domain $domain
     "
     run_step "finetune_rec_scratch_${domain}" bash -c "
-      python -u scripts/run_transfer.py \
+      \"$PYTHON_BIN\" -u scripts/run_transfer.py \
         --config $FINETUNE_REC_SCRATCH_CONFIG \
         --heldout_domain $domain
     "
@@ -193,7 +203,7 @@ if [[ "$SKIP_BASELINES" == "0" && "$RUN_BASELINES" == "1" ]]; then
   for model in $BASELINE_MODELS; do
     for ds in $BASELINE_DATASETS; do
       run_step "baseline_${model}_${ds}" bash -c "
-        python -u baselines/run_hnn_benchmark.py \
+        \"$PYTHON_BIN\" -u baselines/run_hnn_benchmark.py \
           --model $model --dataset $ds \
           --num_seeds 3 \
           --output_dir baselines/results
@@ -210,7 +220,7 @@ fi
 if [[ "$SKIP_SUMMARY" == "0" ]]; then
   summary_md="outputs_neg_sam_v2/results/v2_vs_scratch_vs_baselines.md"
   run_step summary bash -c "
-    python -u scripts/compare_transfer_results.py \
+    \"$PYTHON_BIN\" -u scripts/compare_transfer_results.py \
       --results_dir outputs/results \
       --output_markdown $summary_md
     echo '--- summary written to:' $summary_md

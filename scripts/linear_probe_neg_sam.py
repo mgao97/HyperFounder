@@ -191,7 +191,13 @@ def _load_graphs(args) -> list:
 
 def main() -> None:
     args = _parse_args()
-    device = torch.device(args.device)
+    requested_device = str(args.device)
+    if requested_device.startswith("cuda") and not torch.cuda.is_available():
+        print(
+            f"[LinearProbe] WARN: requested device={requested_device} but CUDA is unavailable; falling back to cpu"
+        )
+        requested_device = "cpu"
+    device = torch.device(requested_device)
     cfg = load_yaml(args.config)
 
     print(f"[LinearProbe] device={device}, datasets={args.datasets}, seeds={args.seeds}")

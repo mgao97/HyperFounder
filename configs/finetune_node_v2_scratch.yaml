@@ -21,6 +21,7 @@ training:
   num_seeds: 3
   early_stopping:
     patience: 50
+  val_check_interval: 5     # run the (expensive) val forward only every N epochs
   output_dir: outputs
   # Intentionally null — DownstreamTrainerBase.build_encoder() will use random init.
   pretrained_checkpoint: null

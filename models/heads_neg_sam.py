@@ -116,24 +116,41 @@ class StructureAlignmentHead(nn.Module):
         )
 
     def encode_node_structure(self, node_emb: torch.Tensor, edge_emb: torch.Tensor, incidence: torch.Tensor) -> torch.Tensor:
-        dense_inc = incidence.to_dense() if incidence.is_sparse else incidence
-        num_nodes = node_emb.size(0)
-        node_context = torch.zeros_like(node_emb)
-        for i in range(num_nodes):
-            incident_edges = dense_inc[i].nonzero(as_tuple=True)[0]
-            if incident_edges.numel() > 0:
-                node_context[i] = edge_emb[incident_edges].mean(dim=0)
+        # Fully-sparse gather of mean edge embedding incident to each node.
+        # Avoids materialising a dense [N, E] matrix (OOM on large hypergraphs).
+        if not incidence.is_sparse:
+            incidence = incidence.to_sparse_coo()
+        s = incidence.coalesce()
+        idx = s.indices()
+        row, col = idx[0], idx[1]  # row=node, col=edge
+        dim = edge_emb.size(-1)
+        device = edge_emb.device
+        expanded = edge_emb.index_select(0, col)  # [nnz, dim]
+        sums = node_emb.new_zeros((node_emb.size(0), dim), device=device)
+        sums.index_add_(0, row, expanded)
+        counts = torch.zeros(node_emb.size(0), device=device).index_add(
+            0, row, torch.ones(col.numel(), device=device)
+        ).clamp_min(1.0)
+        node_context = sums / counts.unsqueeze(-1)
         combined = torch.cat([node_emb, node_context], dim=-1)
         return self.node_structure_encoder(combined)
 
     def encode_edge_structure(self, node_emb: torch.Tensor, edge_emb: torch.Tensor, incidence: torch.Tensor) -> torch.Tensor:
-        dense_inc = incidence.to_dense() if incidence.is_sparse else incidence
-        num_edges = edge_emb.size(0)
-        edge_context = torch.zeros_like(edge_emb)
-        for i in range(num_edges):
-            members = dense_inc[:, i].nonzero(as_tuple=True)[0]
-            if members.numel() > 0:
-                edge_context[i] = node_emb[members].mean(dim=0)
+        # Fully-sparse gather of mean node embedding belonging to each edge.
+        if not incidence.is_sparse:
+            incidence = incidence.to_sparse_coo()
+        s = incidence.coalesce()
+        idx = s.indices()
+        row, col = idx[0], idx[1]  # row=node, col=edge
+        dim = node_emb.size(-1)
+        device = node_emb.device
+        expanded = node_emb.index_select(0, row)  # [nnz, dim]
+        sums = edge_emb.new_zeros((edge_emb.size(0), dim), device=device)
+        sums.index_add_(0, col, expanded)
+        counts = torch.zeros(edge_emb.size(0), device=device).index_add(
+            0, col, torch.ones(col.numel(), device=device)
+        ).clamp_min(1.0)
+        edge_context = sums / counts.unsqueeze(-1)
         combined = torch.cat([edge_emb, edge_context], dim=-1)
         return self.edge_structure_encoder(combined)
 
@@ -187,13 +204,21 @@ class TaskRouter(nn.Module):
         ]
         
         try:
-            dense_inc = incidence.to_dense() if incidence.is_sparse else incidence
-            if dense_inc.numel() > 0:
-                node_degree = dense_inc.sum(dim=1).float()
-                edge_cardinality = dense_inc.sum(dim=0).float()
+            if not incidence.is_sparse:
+                incidence = incidence.to_sparse_coo()
+            s = incidence.coalesce()
+            idx = s.indices()
+            row, col = idx[0], idx[1]
+            if s.numel() > 0 and s.values().numel() > 0:
+                node_degree = torch.zeros(num_nodes, device=device).index_add(
+                    0, row, torch.ones(row.numel(), device=device)
+                ).float()
+                edge_cardinality = torch.zeros(num_edges, device=device).index_add(
+                    0, col, torch.ones(col.numel(), device=device)
+                ).float()
                 basic_features[2] = min(node_degree.mean().item() / 10.0, 10.0) if node_degree.numel() > 0 else 1.0
                 basic_features[3] = min(edge_cardinality.mean().item() / 5.0, 10.0) if edge_cardinality.numel() > 0 else 1.0
-                basic_features[4] = min((dense_inc > 0).float().mean().item(), 1.0)
+                basic_features[4] = min((float(row.numel()) / max(float(num_nodes) * float(num_edges), 1.0)), 1.0)
         except Exception:
             pass
         

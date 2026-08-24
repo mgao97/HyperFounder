@@ -16,6 +16,26 @@ def _dense_incidence(incidence: torch.Tensor) -> torch.Tensor:
     return incidence
 
 
+def _build_groups(keys: torch.Tensor, values: torch.Tensor, num_keys: int) -> list:
+    """Group `values` by `keys` into a list of length `num_keys`.
+
+    Returns a list where out[k] is a 1-D tensor of all `values` whose key == k
+    (or None when key k is absent). Uses a sort + unique_consecutive split so it
+    scales to tens of thousands of keys without any dense [N, E] allocation.
+    """
+    if keys.numel() == 0:
+        return [None] * num_keys
+    order = torch.argsort(keys, stable=True)
+    keys_s = keys[order]
+    vals_s = values[order]
+    unique, counts = torch.unique_consecutive(keys_s, return_counts=True)
+    splits = torch.split(vals_s, counts.tolist())
+    out = [None] * num_keys
+    for u, g in zip(unique.tolist(), splits):
+        out[u] = g
+    return out
+
+
 class CrossDomainProjector(nn.Module):
     def __init__(self, d_out: int):
         super().__init__()
@@ -96,63 +116,80 @@ class DomainAlignmentLoss(nn.Module):
 
 
 def overlap_coefficient(incidence: torch.Tensor) -> torch.Tensor:
-    dense = _dense_incidence(incidence)
-    if dense.size(1) == 0:
-        return dense.new_zeros((0,))
-    bt_b = dense.transpose(0, 1) @ dense
-    cardinality = dense.sum(dim=0)
-    min_cardinality = torch.minimum(cardinality.unsqueeze(0), cardinality.unsqueeze(1))
-    overlap = bt_b / min_cardinality.clamp_min(1e-8)
-    return torch.nan_to_num(overlap.mean(dim=1), nan=0.0, posinf=0.0, neginf=0.0)
+    # Memory-efficient, *fully sparse* overlap coefficient.
+    #
+    # The previous dense version built `bt_b = dense.T @ dense` (O(E^2) memory)
+    # and even the chunked rewrite still relied on `_dense_incidence` which
+    # materialises the full [N, E] incidence matrix -> OOM on large hypergraphs
+    # (coauthorship_dblp: 19800 x 27800 -> ~2.2 GB).
+    #
+    # Here we stay sparse end-to-end. `It @ I` is a sparse [E, E] matrix whose
+    # (i, j) entry equals |e_i ∩ e_j|. We divide each entry by min(|e_i|,|e_j|)
+    # and scatter-add the per-edge numerator, so peak memory is O(nnz) and we
+    # never allocate a dense [N, E] or [E, E] tensor.
+    if not incidence.is_sparse:
+        incidence = incidence.to_sparse_coo()
+    s = incidence.coalesce()
+    num_edges = s.size(1)
+    if num_edges == 0:
+        return s.values().new_zeros((0,))
+    idx = s.indices()
+    col = idx[1]
+    device = idx.device
+    c = torch.zeros(num_edges, device=device, dtype=torch.float32)
+    c.scatter_add_(0, col, torch.ones(col.numel(), device=device))
+    It = s.transpose(0, 1).coalesce()  # [E, N] sparse
+    EI = torch.sparse.mm(It, s)        # [E, E] sparse, EI[i, j] = |e_i ∩ e_j|
+    ei = EI.indices()
+    ev = EI.values().to(torch.float32)
+    c1 = c[ei[0]]
+    c2 = c[ei[1]]
+    min_c = torch.minimum(c1, c2).clamp_min(1e-8)
+    div = ev / min_c
+    numerator = torch.zeros(num_edges, device=device, dtype=torch.float32)
+    numerator.scatter_add_(0, ei[0], div)
+    overlap_mean = numerator / num_edges
+    return torch.nan_to_num(overlap_mean, nan=0.0, posinf=0.0, neginf=0.0)
 
 
 def hypergraph_rw_pe(incidence: torch.Tensor, num_steps: int = 5,
                       chunk_size: int = 256) -> torch.Tensor:
-    # NOTE: previous implementation allocated three O(N^2) matrices
-    # (d_v_inv, d_e_inv, w) plus the full transition matrix, which OOMs
-    # on large hypergraphs (e.g. gowalla with 40K nodes). This version
-    # chunks the computation: it never materialises any [N, N] matrix.
-    # Memory peak per chunk is O(chunk_size * max(num_nodes, num_edges)).
-    dense = _dense_incidence(incidence)
-    num_nodes = dense.size(0)
-    num_edges = dense.size(1) if dense.dim() > 1 else 0
+    # Fully sparse random-walk PE. No dense [N, E] matrix is ever materialised.
+    #
+    # P = D_v^-1 @ I @ D_e^-1 @ I^T. We multiply a chunk of identity rows by P
+    # iteratively (dense@sparse -> dense), keeping only the diagonal of P^k for
+    # each chunk. Memory peak is O(chunk_size * max(num_nodes, num_edges)).
+    if not incidence.is_sparse:
+        incidence = incidence.to_sparse_coo()
+    s = incidence.coalesce()
+    num_nodes = s.size(0)
+    num_edges = s.size(1)
     if num_nodes == 0:
-        return dense.new_zeros((0, num_steps))
-    device = dense.device
-    dtype = dense.dtype
-    node_degree = dense.sum(dim=1).clamp_min(1.0)
-    edge_degree = dense.sum(dim=0).clamp_min(1.0)
-    node_degree_inv = (1.0 / node_degree).to(dtype=dtype)  # [num_nodes]
-    edge_degree_inv = (1.0 / edge_degree).to(dtype=dtype) if num_edges > 0 else None
+        return s.values().new_zeros((0, num_steps))
+    device = s.device
+    node_degree = torch.sparse.sum(s, dim=1).to_dense().clamp_min(1.0)
+    edge_degree = torch.sparse.sum(s, dim=0).to_dense().clamp_min(1.0)
+    node_degree_inv = 1.0 / node_degree  # [num_nodes]
+    edge_degree_inv = 1.0 / edge_degree  # [num_edges]
 
-    # We compute diag(P^k) for k = 1..num_steps where
-    # P = D_v^-1 @ D @ D_e^-1 @ D^T, by iteratively multiplying a
-    # chunk of identity rows by (P). At each step we only keep the
-    # diagonal elements of that chunk.
-    rw_features = torch.zeros(num_nodes, num_steps, device=device, dtype=dtype)
+    rw_features = torch.zeros(num_nodes, num_steps, device=device, dtype=torch.float32)
     chunk_size = max(1, min(int(chunk_size), num_nodes))
-    dense_t = dense.transpose(0, 1)  # [num_edges, num_nodes]
+    s_t = s.transpose(0, 1).coalesce()  # [E, N] sparse (for cur @ s == s_t^T @ cur^T)
 
     for cs in range(0, num_nodes, chunk_size):
         ce = min(cs + chunk_size, num_nodes)
         cur_chunk = ce - cs
         chunk_idx = torch.arange(cur_chunk, device=device)
-        # cur = identity rows for this chunk  (shape: [cur_chunk, num_nodes])
-        cur = torch.zeros(cur_chunk, num_nodes, device=device, dtype=dtype)
+        cur = torch.zeros(cur_chunk, num_nodes, device=device, dtype=torch.float32)
         cur[chunk_idx, cs + chunk_idx] = 1.0
 
         for k in range(num_steps):
-            # cur = e_i^T @ transition = e_i^T @ D_v^-1 @ D @ D_e^-1 @ D^T
-            # Scale rows by 1/node_degree (broadcast over columns)
             cur = cur * node_degree_inv.unsqueeze(0)
-            # cur @ D   [cur_chunk, num_edges]
-            cur = cur @ dense
-            # Scale cols by 1/edge_degree
-            if edge_degree_inv is not None:
-                cur = cur * edge_degree_inv.unsqueeze(0)
-            # cur @ D^T  [cur_chunk, num_nodes]
-            cur = cur @ dense_t
-            # Extract diagonal for this chunk
+            # cur @ s  ==  (s_t^T @ cur^T)^T ; use sparse-left matmul (CPU/CUDA safe)
+            cur = torch.sparse.mm(s_t, cur.transpose(0, 1)).transpose(0, 1)  # [chunk, E]
+            cur = cur * edge_degree_inv.unsqueeze(0)
+            # cur @ It == (It^T @ cur^T)^T == (s @ cur^T)^T
+            cur = torch.sparse.mm(s, cur.transpose(0, 1)).transpose(0, 1)    # [chunk, N]
             rw_features[cs:ce, k] = cur[chunk_idx, cs + chunk_idx]
 
     rw_features = torch.nan_to_num(rw_features, nan=0.0, posinf=0.0, neginf=0.0)
@@ -181,18 +218,30 @@ class CrossDomainStructuralPEModule(nn.Module):
         node_weights: torch.Tensor | None = None,
         edge_weights: torch.Tensor | None = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        dense = _dense_incidence(incidence)
+        # Operate directly on the sparse COO incidence [N, E]; never build the
+        # dense [N, E] matrix (that is what previously OOMed on big graphs).
+        if not incidence.is_sparse:
+            incidence = incidence.to_sparse_coo()
+        s = incidence.coalesce()
+        idx = s.indices()
+        num_nodes = s.size(0)
+        num_edges = s.size(1)
+        device = s.device
         if node_weights is None:
-            node_weights = dense.new_ones((dense.size(0),))
+            node_weights = torch.ones(num_nodes, device=device)
         if edge_weights is None:
-            edge_weights = dense.new_ones((dense.size(1),))
-        node_degree = (dense * edge_weights.unsqueeze(0)).sum(dim=1)
-        edge_cardinality = (dense * node_weights.unsqueeze(1)).sum(dim=0)
+            edge_weights = torch.ones(num_edges, device=device)
+        # node_degree[n] = sum_e I[n,e] * edge_weights[e]
+        node_degree = torch.zeros(num_nodes, device=device)
+        node_degree.scatter_add_(0, idx[0], edge_weights.to(torch.float32)[idx[1]])
+        # edge_cardinality[e] = sum_n I[n,e] * node_weights[n]
+        edge_cardinality = torch.zeros(num_edges, device=device)
+        edge_cardinality.scatter_add_(0, idx[1], node_weights.to(torch.float32)[idx[0]])
         node_degree_norm = node_degree / node_degree.max().clamp_min(1e-8)
         edge_cardinality_norm = edge_cardinality / edge_cardinality.max().clamp_min(1e-8)
-        rw_pe = hypergraph_rw_pe(dense, num_steps=self.num_rw_steps)
+        rw_pe = hypergraph_rw_pe(incidence, num_steps=self.num_rw_steps)
         node_raw = torch.cat([node_degree_norm.unsqueeze(-1), rw_pe], dim=-1)
-        edge_overlap = overlap_coefficient(dense).unsqueeze(-1)
+        edge_overlap = overlap_coefficient(incidence).unsqueeze(-1)
         edge_raw = torch.cat([edge_cardinality_norm.unsqueeze(-1), edge_overlap], dim=-1)
         pe_node = self.node_mlp(node_raw)
         pe_edge = self.edge_mlp(edge_raw)
@@ -521,13 +570,21 @@ class DualLevelAttentionModule(nn.Module):
     def forward(self, node_tokens: torch.Tensor, edge_tokens: torch.Tensor, incidence: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         if node_tokens.numel() == 0 and edge_tokens.numel() == 0:
             return node_tokens, edge_tokens
-        dense = _dense_incidence(incidence).to(torch.bool)
+        # Build sparse index groupings instead of a dense [N, E] incidence matrix
+        # (the dense conversion previously OOMed on large hypergraphs).
+        sp = incidence if incidence.is_sparse else incidence.to_sparse_coo()
+        sp = sp.coalesce()
+        node_idx, edge_idx = sp.indices()
+        num_nodes = sp.size(0)
+        num_edges = sp.size(1)
+        edge_to_nodes = _build_groups(edge_idx, node_idx, num_edges)
+        node_to_edges = _build_groups(node_idx, edge_idx, num_nodes)
 
         if edge_tokens.numel():
             updated_edges = []
             for edge_id in range(edge_tokens.size(0)):
-                members = torch.nonzero(dense[:, edge_id], as_tuple=False).view(-1)
-                if members.numel() == 0:
+                members = edge_to_nodes[edge_id]
+                if members is None or members.numel() == 0:
                     updated_edges.append(edge_tokens[edge_id])
                     continue
                 node_seq = node_tokens[members].unsqueeze(0)
@@ -540,8 +597,8 @@ class DualLevelAttentionModule(nn.Module):
         if node_tokens.numel() and edge_tokens.numel():
             updated_nodes = []
             for node_id in range(node_tokens.size(0)):
-                incident_edges = torch.nonzero(dense[node_id, :], as_tuple=False).view(-1)
-                if incident_edges.numel() == 0:
+                incident_edges = node_to_edges[node_id]
+                if incident_edges is None or incident_edges.numel() == 0:
                     updated_nodes.append(node_tokens[node_id])
                     continue
                 query = node_tokens[node_id].view(1, 1, -1)
@@ -567,14 +624,18 @@ class HierarchicalHypergraphPooling(nn.Module):
         self.edge_assign = nn.Linear(hidden_dim, pooled_edges)
 
     def forward(self, node_tokens: torch.Tensor, edge_tokens: torch.Tensor, incidence: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        dense = _dense_incidence(incidence).to(node_tokens.dtype if node_tokens.numel() else edge_tokens.dtype)
         if node_tokens.numel() == 0 or edge_tokens.numel() == 0:
             return node_tokens, edge_tokens, incidence
+        # Keep the incidence sparse: pooled_incidence = s_node^T @ I @ s_edge,
+        # computed as (dense[P,N] @ sparse[N,E]) @ dense[E,P] -> [P,P], never
+        # materialising the dense [N,E] incidence matrix.
+        sp = incidence if incidence.is_sparse else incidence.to_sparse_coo()
+        sp = sp.coalesce()
         s_node = torch.softmax(self.node_assign(node_tokens), dim=1)
         s_edge = torch.softmax(self.edge_assign(edge_tokens), dim=1)
         pooled_nodes = s_node.transpose(0, 1) @ node_tokens
         pooled_edges = s_edge.transpose(0, 1) @ edge_tokens
-        pooled_incidence = s_node.transpose(0, 1) @ dense @ s_edge
+        pooled_incidence = (s_node.transpose(0, 1) @ sp) @ s_edge
         return (
             torch.nan_to_num(pooled_nodes, nan=0.0, posinf=0.0, neginf=0.0),
             torch.nan_to_num(pooled_edges, nan=0.0, posinf=0.0, neginf=0.0),

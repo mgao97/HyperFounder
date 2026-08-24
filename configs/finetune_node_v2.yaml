@@ -19,6 +19,7 @@ training:
   num_seeds: 3            # report mean ± std
   early_stopping:
     patience: 50
+  val_check_interval: 5     # run the (expensive) val forward only every N epochs
   output_dir: outputs
   pretrained_checkpoint: outputs_neg_sam_v2/checkpoints/pretrain_best_neg_sam.pt
   task_name: node
