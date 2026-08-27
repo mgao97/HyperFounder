@@ -68,6 +68,7 @@ class PretrainTrainerNegSam(TrainerBase):
             structure_pe_dim=int(config["model"].get("structure_pe_dim", config["model"].get("spectral_dim", 0))),
             num_domains=len(sorted(self.domains)) if self.domains else 1,
             domain_names=sorted(self.domains),
+            max_k=int(config["model"].get("max_k", 512)),
             use_domain_adapter=use_domain_adapter,
             adapter_type=adapter_type,
             adapter_dim=adapter_dim,

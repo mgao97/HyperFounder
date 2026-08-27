@@ -9,6 +9,9 @@ model:
   num_layers: 4
   num_heads: 8
   structure_pe_dim: 8
+  max_k: 512        # cap packed seq len per hyperedge/node; avoids the
+                    # "CUDA error: invalid configuration argument" crash on
+                    # large graphs (pubmed) caused by oversized hyperedges.
 
 training:
   seed: 7

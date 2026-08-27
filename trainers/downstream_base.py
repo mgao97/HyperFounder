@@ -28,6 +28,7 @@ class DownstreamTrainerBase(TrainerBase):
             structure_pe_dim=int(self.config["model"].get("structure_pe_dim", self.config["model"].get("spectral_dim", 0))),
             num_domains=len(domain_names) if domain_names else 1,
             domain_names=domain_names,
+            max_k=int(self.config["model"].get("max_k", 512)),
         ).to(self.device)
         checkpoint_path = self.config["training"].get("pretrained_checkpoint")
         if checkpoint_path and Path(checkpoint_path).exists():

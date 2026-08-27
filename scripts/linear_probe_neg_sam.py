@@ -75,6 +75,7 @@ def _build_encoder(config: dict, device: torch.device) -> UnifiedHypergraphEncod
         structure_pe_dim=int(config["model"].get("structure_pe_dim", 0)),
         num_domains=1,
         domain_names=["probe"],
+        max_k=int(config["model"].get("max_k", 512)),
     ).to(device)
     return enc
 

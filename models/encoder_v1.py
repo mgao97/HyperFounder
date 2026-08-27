@@ -5,7 +5,7 @@ from typing import Dict, List, Optional, Sequence
 import torch
 from torch import nn
 
-from models.cross_domain_modules import (
+from models.cross_domain_modules_v1 import (
     CrossDomainFeatureProjectionModule,
     CrossDomainStructuralPEModule,
     DynamicDomainAdapter,
@@ -18,7 +18,18 @@ from utils.hypergraph import SimpleHypergraph
 from utils.sampling import build_community_embeddings, build_cross_scale_embeddings, build_motif_embeddings, sample_communities, sample_motifs
 
 
-class UnifiedHypergraphEncoder(nn.Module):
+class UnifiedHypergraphEncoderV1(nn.Module):
+    """v1 encoder: OOM-safe attention + optional shared-branch return for downstream use.
+
+    Key changes vs. encoder.py:
+      * Uses cross_domain_modules_v1 (chunked intra/cross attention, no whole-graph KV packing).
+      * Adds `return_shared` flag: when a disentangler is supplied, the returned
+        node/edge embeddings are replaced by their *shared* projections so that the
+        downstream fine-tuner consumes the transferable representation that the
+        pre-training objective actually optimizes (fixes the previous mismatch where
+        pre-training aligned z_shared but fine-tuning used the raw node_emb).
+    """
+
     def __init__(
         self,
         in_dim: int,
@@ -65,8 +76,7 @@ class UnifiedHypergraphEncoder(nn.Module):
         )
         self.readout_projection = nn.Linear(hidden_dim * 2, hidden_dim)
         self.subhypergraph_projection = nn.Linear(hidden_dim * 2, hidden_dim)
-        
-        # Dynamic domain adapter for domain-specific adaptation
+
         self.use_domain_adapter = use_domain_adapter
         self.adapter_type = adapter_type
         if use_domain_adapter:
@@ -79,12 +89,16 @@ class UnifiedHypergraphEncoder(nn.Module):
             )
         else:
             self.domain_adapter = None
-        
+
         if domain_names is None:
             self.domain_to_id: Dict[str, int] = {}
         else:
             self.domain_to_id = {str(name): index for index, name in enumerate(domain_names)}
         self.num_domains = int(num_domains)
+        # v1: structural sub-sampling (motifs/communities) is off by default for
+        # downstream fine-tuning; set True only when pre-training uses them.
+        self.use_communities = False
+        self.use_motifs = False
 
     def encode_candidate_hyperedges(self, node_emb: torch.Tensor, hyperedges: List[List[int]]) -> torch.Tensor:
         if not hyperedges:
@@ -105,14 +119,13 @@ class UnifiedHypergraphEncoder(nn.Module):
         motifs: Optional[List[Dict[str, List[int]]]] = None,
         communities: Optional[List[Dict[str, List[int]]]] = None,
         motif_seed: int = 0,
+        return_shared: bool = False,
+        node_disentangler=None,
+        edge_disentangler=None,
     ):
         if isinstance(hg, HypergraphData):
             data = hg
             feature_tensor = hg.node_features
-            # Keep the incidence matrix sparse — materialising a [N, E] dense
-            # matrix for large hypergraphs (e.g. coauthorship_dblp: ~49860 x E)
-            # OOMs the GPU. Downstream consumers that need a dense view call
-            # .to_dense() lazily on the CPU/small graphs.
             incidence_dense = (
                 hg.incidence_matrix.to_sparse_coo()
                 if hg.incidence_matrix.is_sparse
@@ -168,22 +181,27 @@ class UnifiedHypergraphEncoder(nn.Module):
         node_tokens = self.projector(data.node_features, domain_id=data.domain_id, is_edge=False) + pe_node
         edge_tokens = self.projector(data.edge_features, domain_id=data.domain_id, is_edge=True) + pe_edge
 
-        sparse_attn_index = []
         for layer in self.encoder_layers:
-            node_tokens, edge_tokens, layer_topk = layer(node_tokens, edge_tokens, incidence)
-            sparse_attn_index.append(layer_topk)
+            node_tokens, edge_tokens, _ = layer(node_tokens, edge_tokens, incidence)
 
         node_emb = torch.nan_to_num(node_tokens, nan=0.0, posinf=0.0, neginf=0.0)
         edge_emb = torch.nan_to_num(edge_tokens, nan=0.0, posinf=0.0, neginf=0.0)
 
-        # Apply domain adapter for domain-specific adaptation
         if self.domain_adapter is not None:
             domain_id_int = int(data.domain_id) if hasattr(data, 'domain_id') else 0
             node_adapter_out = self.domain_adapter(node_emb, domain_id_int)
             edge_adapter_out = self.domain_adapter(edge_emb, domain_id_int)
-            # Residual-like combination: shared + adapter
             node_emb = node_emb + node_adapter_out
             edge_emb = edge_emb + edge_adapter_out
+
+        # v1: optionally replace raw embeddings with their shared disentangled branch,
+        # so downstream tasks use the transferable representation actually optimized
+        # during pre-training.
+        if return_shared and node_disentangler is not None and edge_disentangler is not None:
+            z_node_shared, _, _ = node_disentangler(node_emb)
+            z_edge_shared, _, _ = edge_disentangler(edge_emb)
+            node_emb = node_emb + z_node_shared  # residual fusion keeps raw signal + shared
+            edge_emb = edge_emb + z_edge_shared
 
         pooled_nodes, pooled_edges, pooled_incidence = self.pooling_module(node_emb, edge_emb, incidence)
         node_graph = pooled_nodes.mean(dim=0) if pooled_nodes.numel() else node_emb.mean(dim=0)
@@ -199,7 +217,7 @@ class UnifiedHypergraphEncoder(nn.Module):
             sample_motifs(source_hg, budget=motif_budget, seed=motif_seed) if source_hg is not None else []
         )
         community_items = communities if communities is not None else (
-            sample_communities(source_hg) if source_hg is not None else []
+            sample_communities(source_hg) if (source_hg is not None and getattr(self, "use_communities", False)) else []
         )
         motif_emb = torch.nan_to_num(
             build_motif_embeddings(node_emb, edge_emb, motif_items, self.subhypergraph_projection),
@@ -231,7 +249,6 @@ class UnifiedHypergraphEncoder(nn.Module):
             "pooled_edge_emb": pooled_edges,
             "node_pe": pe_node,
             "edge_pe": pe_edge,
-            "sparse_attn_index": sparse_attn_index[-1] if sparse_attn_index else feature_tensor.new_zeros((feature_tensor.size(0), 0), dtype=torch.long),
             "domain_name": domain_name,
         }
         return node_emb, edge_emb, graph_emb, aux

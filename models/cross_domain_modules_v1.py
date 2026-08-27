@@ -17,12 +17,6 @@ def _dense_incidence(incidence: torch.Tensor) -> torch.Tensor:
 
 
 def _build_groups(keys: torch.Tensor, values: torch.Tensor, num_keys: int) -> list:
-    """Group `values` by `keys` into a list of length `num_keys`.
-
-    Returns a list where out[k] is a 1-D tensor of all `values` whose key == k
-    (or None when key k is absent). Uses a sort + unique_consecutive split so it
-    scales to tens of thousands of keys without any dense [N, E] allocation.
-    """
     if keys.numel() == 0:
         return [None] * num_keys
     order = torch.argsort(keys, stable=True)
@@ -116,22 +110,9 @@ class DomainAlignmentLoss(nn.Module):
 
 
 def overlap_coefficient(incidence: torch.Tensor) -> torch.Tensor:
-    # Memory-efficient, *fully sparse* overlap coefficient.
-    #
-    # The previous dense version built `bt_b = dense.T @ dense` (O(E^2) memory)
-    # and even the chunked rewrite still relied on `_dense_incidence` which
-    # materialises the full [N, E] incidence matrix -> OOM on large hypergraphs
-    # (coauthorship_dblp: 19800 x 27800 -> ~2.2 GB).
-    #
-    # Here we stay sparse end-to-end. `It @ I` is a sparse [E, E] matrix whose
-    # (i, j) entry equals |e_i ∩ e_j|. We divide each entry by min(|e_i|,|e_j|)
-    # and scatter-add the per-edge numerator, so peak memory is O(nnz) and we
-    # never allocate a dense [N, E] or [E, E] tensor.
     if not incidence.is_sparse:
         incidence = incidence.to_sparse_coo()
     s = incidence.coalesce()
-    # torch.sparse.mm on CUDA supports only fp32/fp64; cast before the
-    # sparse matrix product so a BFloat16 sparse incidence does not crash.
     if s.dtype != torch.float32:
         s = torch.sparse_coo_tensor(s.indices(), s.values().to(torch.float32), s.size())
     num_edges = s.size(1)
@@ -142,11 +123,9 @@ def overlap_coefficient(incidence: torch.Tensor) -> torch.Tensor:
     device = idx.device
     c = torch.zeros(num_edges, device=device, dtype=torch.float32)
     c.scatter_add_(0, col, torch.ones(col.numel(), device=device))
-    It = s.transpose(0, 1).coalesce()  # [E, N] sparse
-    # Disable autocast: finetune runs under bf16 autocast, which forces
-    # sparse.mm to BFloat16 and CUDA sparse kernels reject that dtype.
+    It = s.transpose(0, 1).coalesce()
     with torch.autocast(device_type=device.type, enabled=False):
-        EI = torch.sparse.mm(It, s)        # [E, E] sparse, EI[i, j] = |e_i ∩ e_j|
+        EI = torch.sparse.mm(It, s)
     ei = EI.indices()
     ev = EI.values().to(torch.float32)
     c1 = c[ei[0]]
@@ -162,28 +141,11 @@ def overlap_coefficient(incidence: torch.Tensor) -> torch.Tensor:
 def hypergraph_rw_pe(incidence: torch.Tensor, num_steps: int = 5,
                       chunk_size: int = 256,
                       mem_budget_bytes: int = 256 * 1024 * 1024) -> torch.Tensor:
-    # Fully sparse random-walk PE. No dense [N, E] matrix is ever materialised.
-    #
-    # P = D_v^-1 @ I @ D_e^-1 @ I^T. We multiply a chunk of identity rows by P
-    # iteratively (dense@sparse -> dense), keeping only the diagonal of P^k for
-    # each chunk. Memory peak is O(chunk_size * max(num_nodes, num_edges)).
-    #
-    # The dominant cost is the `torch.sparse.mm` kernel launches (2 per step, per
-    # chunk). We therefore pick the *largest* chunk that fits the memory budget
-    # instead of the tiny default 256, which collapses the number of kernel
-    # launches (e.g. cora: 11 chunks -> 1; dblp: ~195 -> ~39) without changing a
-    # single number -- chunks compute their diagonals independently.
     if not incidence.is_sparse:
         incidence = incidence.to_sparse_coo()
     s = incidence.coalesce()
-    # torch.sparse.mm only supports fp32/fp64 on CUDA; the caller may feed a
-    # BFloat16 sparse incidence (e.g. mixed-precision finetune). Compute in
-    # float32 and cast the result back to the input dtype to stay consistent
-    # with the surrounding tensors.
     in_dtype = s.dtype
     if in_dtype != torch.float32:
-        # Rebuild explicitly: COO .to(dtype) does not reliably recast the
-        # values tensor on some torch builds, so reconstruct from indices.
         s = torch.sparse_coo_tensor(s.indices(), s.values().to(torch.float32), s.size())
     num_nodes = s.size(0)
     num_edges = s.size(1)
@@ -192,14 +154,13 @@ def hypergraph_rw_pe(incidence: torch.Tensor, num_steps: int = 5,
     device = s.device
     node_degree = torch.sparse.sum(s, dim=1).to_dense().clamp_min(1.0)
     edge_degree = torch.sparse.sum(s, dim=0).to_dense().clamp_min(1.0)
-    node_degree_inv = 1.0 / node_degree  # [num_nodes]
-    edge_degree_inv = 1.0 / edge_degree  # [num_edges]
+    node_degree_inv = 1.0 / node_degree
+    edge_degree_inv = 1.0 / edge_degree
 
     rw_features = torch.zeros(num_nodes, num_steps, device=device, dtype=torch.float32)
-    # Largest chunk whose dense [chunk, N] working buffer stays within budget.
     max_chunk_mem = max(1, int(mem_budget_bytes) // (num_nodes * 4))
     chunk_size = min(num_nodes, max(int(chunk_size), max_chunk_mem))
-    s_t = s.transpose(0, 1).coalesce()  # [E, N] sparse (for cur @ s == s_t^T @ cur^T)
+    s_t = s.transpose(0, 1).coalesce()
 
     for cs in range(0, num_nodes, chunk_size):
         ce = min(cs + chunk_size, num_nodes)
@@ -210,16 +171,11 @@ def hypergraph_rw_pe(incidence: torch.Tensor, num_steps: int = 5,
 
         for k in range(num_steps):
             cur = cur * node_degree_inv.unsqueeze(0)
-            # NOTE: finetune runs under autocast(bf16); autocast forces matmul
-            # ops (incl. sparse.mm) to BFloat16, which CUDA sparse kernels
-            # reject. Disable autocast so the sparse product stays float32.
             with torch.autocast(device_type=device.type, enabled=False):
-                # cur @ s  ==  (s_t^T @ cur^T)^T ; use sparse-left matmul (CPU/CUDA safe)
-                cur = torch.sparse.mm(s_t, cur.t()).t()  # [chunk, E]
+                cur = torch.sparse.mm(s_t, cur.t()).t()
             cur = cur * edge_degree_inv.unsqueeze(0)
             with torch.autocast(device_type=device.type, enabled=False):
-                # cur @ It == (It^T @ cur^T)^T == (s @ cur^T)^T
-                cur = torch.sparse.mm(s, cur.t()).t()    # [chunk, N]
+                cur = torch.sparse.mm(s, cur.t()).t()
             rw_features[cs:ce, k] = cur[chunk_idx, cs + chunk_idx]
 
     rw_features = torch.nan_to_num(rw_features, nan=0.0, posinf=0.0, neginf=0.0)
@@ -248,8 +204,6 @@ class CrossDomainStructuralPEModule(nn.Module):
         node_weights: torch.Tensor | None = None,
         edge_weights: torch.Tensor | None = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Operate directly on the sparse COO incidence [N, E]; never build the
-        # dense [N, E] matrix (that is what previously OOMed on big graphs).
         if not incidence.is_sparse:
             incidence = incidence.to_sparse_coo()
         s = incidence.coalesce()
@@ -261,10 +215,8 @@ class CrossDomainStructuralPEModule(nn.Module):
             node_weights = torch.ones(num_nodes, device=device)
         if edge_weights is None:
             edge_weights = torch.ones(num_edges, device=device)
-        # node_degree[n] = sum_e I[n,e] * edge_weights[e]
         node_degree = torch.zeros(num_nodes, device=device)
         node_degree.scatter_add_(0, idx[0], edge_weights.to(torch.float32)[idx[1]])
-        # edge_cardinality[e] = sum_n I[n,e] * node_weights[n]
         edge_cardinality = torch.zeros(num_edges, device=device)
         edge_cardinality.scatter_add_(0, idx[1], node_weights.to(torch.float32)[idx[0]])
         node_degree_norm = node_degree / node_degree.max().clamp_min(1e-8)
@@ -298,8 +250,6 @@ class CrossDomainFeatureProjectionModule(nn.Module):
 
 
 class DomainAdapter(nn.Module):
-    """Domain-specific adapter for learning domain-biased deviations from shared structure."""
-
     def __init__(self, hidden_dim: int, adapter_dim: int = 32):
         super().__init__()
         self.adapter_dim = adapter_dim
@@ -320,8 +270,6 @@ class DomainAdapter(nn.Module):
 
 
 class MoEExpert(nn.Module):
-    """Mixture of Experts routing expert - outputs hidden_dim directly."""
-
     def __init__(self, hidden_dim: int, expert_dim: int = 32):
         super().__init__()
         self.expert_net = nn.Sequential(
@@ -335,13 +283,10 @@ class MoEExpert(nn.Module):
 
 
 class DomainMoE(nn.Module):
-    """Mixture of Experts for domain-specific adaptation."""
-
     def __init__(self, hidden_dim: int, num_domains: int, expert_dim: int = 32, num_experts: int = 4):
         super().__init__()
         self.num_domains = num_domains
         self.num_experts = num_experts
-        # Each expert maps hidden -> expert_dim -> hidden
         self.experts = nn.ModuleList([
             MoEExpert(hidden_dim, expert_dim) for _ in range(num_experts)
         ])
@@ -354,34 +299,18 @@ class DomainMoE(nn.Module):
             return x
         if x.dim() == 1:
             x = x.unsqueeze(0)
-        
-        # Get routing weights
-        routing_logits = self.router(x)  # (batch, num_experts)
-        routing_weights = F.softmax(routing_logits, dim=-1)  # (batch, num_experts)
-        
-        # Stack expert outputs: (num_experts, batch, hidden)
+        routing_logits = self.router(x)
+        routing_weights = F.softmax(routing_logits, dim=-1)
         expert_outputs = torch.stack([expert(x) for expert in self.experts], dim=0)
-        
-        # Weighted sum: (batch, num_experts) @ (num_experts, batch, hidden) -> (batch, hidden)
-        # routing_weights: (batch, num_experts) -> (batch, num_experts, 1)
-        # expert_outputs: (num_experts, batch, hidden) -> (batch, num_experts, hidden) after transpose
-        routing_weights_expanded = routing_weights.unsqueeze(-1)  # (batch, num_experts, 1)
-        expert_outputs_transposed = expert_outputs.transpose(0, 1)  # (batch, num_experts, hidden)
-        
-        adapted = (routing_weights_expanded * expert_outputs_transposed).sum(dim=1)  # (batch, hidden)
-        
+        routing_weights_expanded = routing_weights.unsqueeze(-1)
+        expert_outputs_transposed = expert_outputs.transpose(0, 1)
+        adapted = (routing_weights_expanded * expert_outputs_transposed).sum(dim=1)
         if adapted.size(0) == 1:
             adapted = adapted.squeeze(0)
-        
         return adapted
 
 
 class DynamicDomainAdapter(nn.Module):
-    """
-    Unified dynamic domain adapter supporting both Adapter and MoE modes.
-    Composes shared features with domain-specific adaptations.
-    """
-
     def __init__(
         self,
         hidden_dim: int,
@@ -408,7 +337,6 @@ class DynamicDomainAdapter(nn.Module):
     def forward(self, shared_emb: torch.Tensor, domain_id: int) -> torch.Tensor:
         if shared_emb.numel() == 0:
             return shared_emb
-
         if self.adapter_type == "adapter":
             key = str(domain_id)
             if key not in self.domain_adapters:
@@ -418,106 +346,7 @@ class DynamicDomainAdapter(nn.Module):
             adapter_output = self.domain_moe(shared_emb, domain_id)
         else:
             adapter_output = shared_emb.new_zeros_like(shared_emb)
-
         return adapter_output
-
-
-class StructureAwareAlignment(nn.Module):
-    """
-    Multi-granularity structure alignment module.
-    Aligns node, edge, and subgraph structures across domains.
-    """
-
-    def __init__(self, hidden_dim: int, alignment_type: str = "prototype"):
-        super().__init__()
-        self.alignment_type = alignment_type
-        self.hidden_dim = hidden_dim
-
-        self.structure_encoder = nn.Sequential(
-            nn.Linear(hidden_dim * 2, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-        )
-
-        if alignment_type == "prototype":
-            self.prototype_projector = nn.Linear(hidden_dim, hidden_dim)
-        elif alignment_type == "ot":
-            self.ot_cost_projector = nn.Sequential(
-                nn.Linear(hidden_dim * 2, hidden_dim),
-                nn.ReLU(),
-                nn.Linear(hidden_dim, 1),
-            )
-
-    def compute_structure_features(
-        self,
-        node_emb: torch.Tensor,
-        edge_emb: torch.Tensor,
-        incidence: torch.Tensor,
-    ) -> torch.Tensor:
-        """Compute structure-aware features from node/edge embeddings and incidence."""
-        if incidence.is_sparse:
-            dense_inc = incidence.to_dense()
-        else:
-            dense_inc = incidence
-
-        num_nodes = node_emb.size(0)
-        node_context = torch.zeros_like(node_emb)
-
-        for i in range(num_nodes):
-            incident_edges = dense_inc[i].nonzero(as_tuple=True)[0]
-            if incident_edges.numel() > 0:
-                node_context[i] = edge_emb[incident_edges].mean(dim=0)
-
-        combined = torch.cat([node_emb, node_context], dim=-1)
-        return self.structure_encoder(combined)
-
-    def prototype_alignment_loss(
-        self,
-        node_emb_1: torch.Tensor,
-        node_emb_2: torch.Tensor,
-        num_prototypes: int = 8,
-    ) -> torch.Tensor:
-        """Align structural prototypes across views."""
-        combined_1 = self.compute_structure_features(node_emb_1, node_emb_1, torch.zeros(1, 1))
-        combined_2 = self.compute_structure_features(node_emb_2, node_emb_2, torch.zeros(1, 1))
-
-        proj_1 = F.normalize(self.prototype_projector(combined_1), dim=-1)
-        proj_2 = F.normalize(self.prototype_projector(combined_2), dim=-1)
-
-        prototypes_1 = proj_1[:num_prototypes]
-        prototypes_2 = proj_2[:num_prototypes]
-
-        sim_matrix = prototypes_1 @ prototypes_2.T / 0.07
-        labels = torch.arange(num_prototypes, device=sim_matrix.device)
-
-        loss = F.cross_entropy(sim_matrix, labels)
-        return loss
-
-    def structural_alignment_loss(
-        self,
-        emb_1: torch.Tensor,
-        emb_2: torch.Tensor,
-        struct_weight: float = 0.5,
-    ) -> torch.Tensor:
-        """
-        General structural alignment loss with multi-granularity consistency.
-        """
-        emb_1_norm = F.normalize(emb_1, dim=-1)
-        emb_2_norm = F.normalize(emb_2, dim=-1)
-
-        alignment_loss = 2 - 2 * (emb_1_norm * emb_2_norm).sum(dim=-1).mean()
-
-        if struct_weight > 0:
-            structure_1 = self.compute_structure_features(
-                emb_1, emb_1, torch.zeros(1, 1, device=emb_1.device)
-            )
-            structure_2 = self.compute_structure_features(
-                emb_2, emb_2, torch.zeros(1, 1, device=emb_2.device)
-            )
-            structure_loss = 2 - 2 * (F.normalize(structure_1, dim=-1) * F.normalize(structure_2, dim=-1)).sum(dim=-1).mean()
-            return alignment_loss + struct_weight * structure_loss
-
-        return alignment_loss
 
 
 class ScalableSparseHyperedgeAttention(nn.Module):
@@ -550,9 +379,6 @@ class ScalableSparseHyperedgeAttention(nn.Module):
         value = self.v(edge_tokens)
         num_nodes = node_tokens.size(0)
         device = node_tokens.device
-        # Group all (score, edge) candidates by node, then pack into a padded
-        # [num_nodes, Kmax] tensor so per-node topk/softmax runs in one shot.
-        # Padding scores are -inf -> softmax weight 0 (no contribution).
         order = torch.argsort(node_idx, stable=True)
         n_s, s_s, e_s = node_idx[order], scores[order], edge_idx[order]
         uniq, counts = torch.unique_consecutive(n_s, return_counts=True)
@@ -569,21 +395,17 @@ class ScalableSparseHyperedgeAttention(nn.Module):
         pad_edges[n_s, pos_in_group] = e_s
 
         row_has = (pad_scores > float("-inf")).any(dim=1)
-        # Rows with no candidate (isolated nodes) would be all -inf and make
-        # softmax emit NaN; neutralise them so they receive a zero update.
         pad_scores = torch.where(row_has.unsqueeze(1), pad_scores, torch.zeros_like(pad_scores))
 
         take = min(int(self.topk), k_max)
-        top_scores, top_pos = pad_scores.topk(take, dim=1)  # [num_nodes, take]
-        attn = torch.softmax(top_scores, dim=1)             # -inf padding -> 0 weight
-        gathered_edges = pad_edges.gather(1, top_pos)       # [num_nodes, take]
-        gathered_value = value[gathered_edges.clamp_min(0)]  # padding -> row 0 (masked below)
+        top_scores, top_pos = pad_scores.topk(take, dim=1)
+        attn = torch.softmax(top_scores, dim=1)
+        gathered_edges = pad_edges.gather(1, top_pos)
+        gathered_value = value[gathered_edges.clamp_min(0)]
         pad_mask = (gathered_edges == -1).unsqueeze(-1)
         gathered_value = gathered_value.masked_fill(pad_mask, 0.0)
-        agg = (attn.unsqueeze(-1) * gathered_value).sum(dim=1)  # [num_nodes, d]
-        agg = agg * row_has.unsqueeze(1).to(agg.dtype)      # isolated nodes -> agg 0
-        # Isolated nodes must receive *no* update at all (not even the Linear
-        # bias); zero the projected residual for them to match the loop version.
+        agg = (attn.unsqueeze(-1) * gathered_value).sum(dim=1)
+        agg = agg * row_has.unsqueeze(1).to(agg.dtype)
         update = self.dropout(self.out(agg)) * row_has.unsqueeze(1).to(agg.dtype)
         updated = node_tokens + update
         topk_index = torch.full((num_nodes, self.topk), -1, dtype=torch.long, device=device)
@@ -592,22 +414,11 @@ class ScalableSparseHyperedgeAttention(nn.Module):
 
 
 class DualLevelAttentionModule(nn.Module):
+    """v1: chunked intra-edge and cross-attention to avoid whole-graph KV packing (OOM fix)."""
+
     def __init__(self, hidden_dim: int, num_heads: int, dropout: float, max_k: int = 512):
         super().__init__()
-        # Cap the packed sequence length (k_max) used by the batched MHA calls.
-        # Hypergraphs such as pubmed contain hyperedges with tens of thousands of
-        # members; letting k_max follow the largest edge makes the
-        # [num_edges, k_max, d] buffer explode and triggers
-        # "CUDA error: invalid configuration argument" in scaled_dot_product_attention.
-        # Truncating oversized groups to max_k keeps the kernel valid and bounds memory.
         self.max_k = int(max_k)
-        # The batched MHA is called once for ALL hyperedges (or all nodes) at once.
-        # On whole-graph forward passes this batch dimension can reach ~90k
-        # (pubmed: 88,676 edges), i.e. batch*num_heads >> 65535, which exceeds the
-        # 16-bit CUDA grid limit and raises "CUDA error: invalid configuration
-        # argument" inside scaled_dot_product_attention. We therefore split the
-        # call into chunks of at most max_batch rows (per call), which keeps the
-        # kernel config valid without changing the math.
         self.num_heads = int(num_heads)
         self.max_batch = 4096
         self._safe_chunk = max(1, min(self.max_batch, 65535 // self.num_heads))
@@ -632,16 +443,7 @@ class DualLevelAttentionModule(nn.Module):
         self.node_norm2 = nn.LayerNorm(hidden_dim)
         self.edge_norm2 = nn.LayerNorm(hidden_dim)
 
-    def _chunked_mha(self, mha: nn.MultiheadAttention, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
-                     key_padding_mask: torch.Tensor) -> torch.Tensor:
-        """Run batched MHA over rows split into safe-size chunks.
-
-        nn.MultiheadAttention -> scaled_dot_product_attention crashes with
-        "CUDA error: invalid configuration argument" when batch*num_heads exceeds
-        the 16-bit CUDA grid limit (65535), which happens on whole-graph forward
-        passes over large hypergraphs (pubmed: 88k edges). Chunking the batch
-        dimension keeps every kernel launch within the limit.
-        """
+    def _chunked_mha(self, mha, q, k, v, key_padding_mask):
         b = q.size(0)
         if b <= self._safe_chunk:
             out, _ = mha(q, k, v, key_padding_mask=key_padding_mask, need_weights=False)
@@ -655,77 +457,126 @@ class DualLevelAttentionModule(nn.Module):
             outs.append(out_i)
         return torch.cat(outs, dim=0)
 
-    def forward(self, node_tokens: torch.Tensor, edge_tokens: torch.Tensor, incidence: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        if node_tokens.numel() == 0 and edge_tokens.numel() == 0:
-            return node_tokens, edge_tokens
-        device = node_tokens.device
-        # Build sparse index groupings instead of a dense [N, E] incidence matrix
-        # (the dense conversion previously OOMed on large hypergraphs).
+    def _intra_edge_attention(self, edge_tokens, node_tokens, incidence, device, d):
+        """Per-edge self-attention over member nodes, processed in chunks of edges."""
+        sp = incidence if incidence.is_sparse else incidence.to_sparse_coo()
+        sp = sp.coalesce()
+        node_idx, edge_idx = sp.indices()
+        num_edges = sp.size(1)
+        order = torch.argsort(edge_idx, stable=True)
+        e_s, n_s = edge_idx[order], node_idx[order]
+        _, counts = torch.unique_consecutive(e_s, return_counts=True)
+        k_max = int(counts.max().item()) if counts.numel() else 0
+        if k_max == 0:
+            return edge_tokens
+        eff_k = min(k_max, self.max_k)
+        starts = torch.cat([torch.zeros(1, dtype=torch.long, device=device), counts.cumsum(0)])
+        starts_exp = starts[:-1].repeat_interleave(counts)
+        pos_in_group = torch.arange(e_s.numel(), device=device) - starts_exp
+        keep = pos_in_group < eff_k
+        e_s, n_s, pos_in_group = e_s[keep], n_s[keep], pos_in_group[keep]
+
+        # Build per-edge member lists (sparse-friendly) and process chunk-by-chunk.
+        edge_groups = _build_groups(e_s, n_s, num_edges)
+        pooled = edge_tokens.new_zeros((num_edges, d))
+        valid = torch.zeros(num_edges, dtype=torch.bool, device=device)
+        for start in range(0, num_edges, self._safe_chunk):
+            end = min(start + self._safe_chunk, num_edges)
+            seqs = []
+            masks = []
+            for eid in range(start, end):
+                members = edge_groups[eid]
+                if members is None or members.numel() == 0:
+                    seqs.append(edge_tokens.new_zeros((1, eff_k, d)))
+                    masks.append(torch.ones(1, eff_k, dtype=torch.bool, device=device))
+                    continue
+                members = members[:eff_k]
+                seq = node_tokens[members].unsqueeze(0)  # [1, k, d]
+                k_actual = seq.size(1)
+                if k_actual < eff_k:
+                    pad = edge_tokens.new_zeros((1, eff_k - k_actual, d))
+                    seq = torch.cat([seq, pad], dim=1)
+                seqs.append(seq)
+                m = torch.zeros(1, k_actual, dtype=torch.bool, device=device)
+                if eff_k > k_actual:
+                    m = torch.cat([m, torch.ones(1, eff_k - k_actual, dtype=torch.bool, device=device)], dim=1)
+                masks.append(m)
+            seq = torch.cat(seqs, dim=0)              # [chunk, eff_k, d]
+            mask = torch.cat(masks, dim=0)            # [chunk, eff_k]
+            attn_out = self._chunked_mha(self.intra, seq, seq, seq, mask)
+            attn_out = attn_out.masked_fill(mask.unsqueeze(-1), 0.0)
+            v = (~mask).unsqueeze(-1).to(attn_out.dtype)
+            p = (attn_out * v).sum(dim=1) / v.sum(dim=1).clamp_min(1.0)
+            pooled[start:end] = p
+            for off, eid in enumerate(range(start, end)):
+                members = edge_groups[eid]
+                valid[eid] = members is not None and members.numel() > 0
+        pooled = torch.where(valid.unsqueeze(-1), pooled, edge_tokens)
+        return self.edge_norm1(edge_tokens + pooled)
+
+    def _node_cross_attention(self, node_tokens, edge_tokens, incidence, device, d):
         sp = incidence if incidence.is_sparse else incidence.to_sparse_coo()
         sp = sp.coalesce()
         node_idx, edge_idx = sp.indices()
         num_nodes = sp.size(0)
-        num_edges = sp.size(1)
+        order = torch.argsort(node_idx, stable=True)
+        n_s, e_s = node_idx[order], edge_idx[order]
+        _, counts = torch.unique_consecutive(n_s, return_counts=True)
+        k_max = int(counts.max().item()) if counts.numel() else 0
+        if k_max == 0:
+            return node_tokens
+        eff_k = min(k_max, self.max_k)
+        starts = torch.cat([torch.zeros(1, dtype=torch.long, device=device), counts.cumsum(0)])
+        starts_exp = starts[:-1].repeat_interleave(counts)
+        pos_in_group = torch.arange(n_s.numel(), device=device) - starts_exp
+        keep = pos_in_group < eff_k
+        n_s, e_s, pos_in_group = n_s[keep], e_s[keep], pos_in_group[keep]
 
+        node_groups = _build_groups(n_s, e_s, num_nodes)
+        updated = node_tokens.clone()
+        kv_valid = torch.zeros(num_nodes, dtype=torch.bool, device=device)
+        for start in range(0, num_nodes, self._safe_chunk):
+            end = min(start + self._safe_chunk, num_nodes)
+            seqs = []
+            masks = []
+            for nid in range(start, end):
+                inc = node_groups[nid]
+                if inc is None or inc.numel() == 0:
+                    seqs.append(edge_tokens.new_zeros((1, eff_k, d)))
+                    masks.append(torch.ones(1, eff_k, dtype=torch.bool, device=device))
+                    continue
+                inc = inc[:eff_k]
+                seq = edge_tokens[inc].unsqueeze(0)  # [1, k, d]
+                k_actual = seq.size(1)
+                if k_actual < eff_k:
+                    pad = edge_tokens.new_zeros((1, eff_k - k_actual, d))
+                    seq = torch.cat([seq, pad], dim=1)
+                seqs.append(seq)
+                m = torch.zeros(1, k_actual, dtype=torch.bool, device=device)
+                if eff_k > k_actual:
+                    m = torch.cat([m, torch.ones(1, eff_k - k_actual, dtype=torch.bool, device=device)], dim=1)
+                masks.append(m)
+            seq = torch.cat(seqs, dim=0)
+            mask = torch.cat(masks, dim=0)
+            query = node_tokens[start:end].unsqueeze(1)  # [chunk, 1, d]
+            # key_padding_mask=mask already excludes padded edges inside MHA,
+            # so no post-hoc masked_fill is needed (and would be shape-mismatched).
+            attn_out = self._chunked_mha(self.inter, query, seq, seq, mask)
+            updated[start:end] = self.node_norm1(node_tokens[start:end] + attn_out.squeeze(1))
+            for off, nid in enumerate(range(start, end)):
+                inc = node_groups[nid]
+                kv_valid[nid] = inc is not None and inc.numel() > 0
+        return updated
+
+    def forward(self, node_tokens, edge_tokens, incidence):
+        if node_tokens.numel() == 0 and edge_tokens.numel() == 0:
+            return node_tokens, edge_tokens
+        device = node_tokens.device
         d = node_tokens.size(-1)
         if edge_tokens.numel():
-            # Pack every edge's member nodes into [E, Kmax_nodes, d] and run the
-            # intra-edge self-attention as a single batched MHA call (no per-edge
-            # Python loop, no batch=1 launch). Padding positions are masked out.
-            order = torch.argsort(edge_idx, stable=True)
-            e_s, n_s = edge_idx[order], node_idx[order]
-            _, counts = torch.unique_consecutive(e_s, return_counts=True)
-            k_max = int(counts.max().item()) if counts.numel() else 0
-            if k_max > 0:
-                # Truncate oversized hyperedges to self.max_k to keep the batched
-                # MHA kernel valid and memory bounded (pubmed-scale graphs otherwise
-                # crash with "CUDA error: invalid configuration argument").
-                eff_k = min(k_max, self.max_k)
-                starts = torch.cat([torch.zeros(1, dtype=torch.long, device=device), counts.cumsum(0)])
-                starts_exp = starts[:-1].repeat_interleave(counts)
-                pos_in_group = torch.arange(e_s.numel(), device=device) - starts_exp
-                keep = pos_in_group < eff_k  # drop members beyond max_k of each edge
-                e_s, n_s, pos_in_group = e_s[keep], n_s[keep], pos_in_group[keep]
-                edge_seq = torch.zeros(num_edges, eff_k, d, device=device)
-                edge_seq[e_s, pos_in_group] = node_tokens[n_s]
-                key_mask = torch.ones(num_edges, eff_k, dtype=torch.bool, device=device)
-                key_mask[e_s, pos_in_group] = False
-                attn_out = self._chunked_mha(self.intra, edge_seq, edge_seq, edge_seq, key_mask)
-                valid = (~key_mask).unsqueeze(-1).to(attn_out.dtype)
-                # Padding (query/kv) positions in attention outputs are zeroed so
-                # fully-padded edges don't emit NaN into the pooled mean.
-                attn_out = attn_out.masked_fill(key_mask.unsqueeze(-1), 0.0)
-                pooled = (attn_out * valid).sum(dim=1) / valid.sum(dim=1).clamp_min(1.0)
-                edge_tokens = self.edge_norm1(edge_tokens + pooled)
-
+            edge_tokens = self._intra_edge_attention(edge_tokens, node_tokens, incidence, device, d)
         if node_tokens.numel() and edge_tokens.numel():
-            # Pack every node's incident edges into [N, Kmax_edges, d] (KV) and
-            # run cross-attention for all nodes in one MHA call. query = node.
-            order = torch.argsort(node_idx, stable=True)
-            n_s, e_s = node_idx[order], edge_idx[order]
-            _, counts = torch.unique_consecutive(n_s, return_counts=True)
-            k_max = int(counts.max().item()) if counts.numel() else 0
-            if k_max > 0:
-                # Same truncation safeguard as the intra-edge branch.
-                eff_k = min(k_max, self.max_k)
-                starts = torch.cat([torch.zeros(1, dtype=torch.long, device=device), counts.cumsum(0)])
-                starts_exp = starts[:-1].repeat_interleave(counts)
-                pos_in_group = torch.arange(n_s.numel(), device=device) - starts_exp
-                keep = pos_in_group < eff_k  # drop incident edges beyond max_k of each node
-                n_s, e_s, pos_in_group = n_s[keep], e_s[keep], pos_in_group[keep]
-                node_seq = torch.zeros(num_nodes, eff_k, d, device=device)
-                node_seq[n_s, pos_in_group] = edge_tokens[e_s]
-                node_mask = torch.ones(num_nodes, eff_k, dtype=torch.bool, device=device)
-                node_mask[n_s, pos_in_group] = False
-                query_seq = node_tokens.unsqueeze(1)  # [N, 1, d]
-                attn_out = self._chunked_mha(self.inter, query_seq, node_seq, node_seq, node_mask)
-                # Nodes with no incident edges have fully-padded KV -> masked
-                # attention emits NaN; zero those rows (no residual update).
-                kv_valid = (~node_mask).sum(dim=1)
-                row_zero = (kv_valid == 0).unsqueeze(1).unsqueeze(2)
-                attn_out = attn_out.masked_fill(row_zero, 0.0)
-                node_tokens = self.node_norm1(node_tokens + attn_out.squeeze(1))
-
+            node_tokens = self._node_cross_attention(node_tokens, edge_tokens, incidence, device, d)
         if node_tokens.numel():
             node_tokens = self.node_norm2(node_tokens + self.node_ffn(node_tokens))
         if edge_tokens.numel():
@@ -741,22 +592,19 @@ class HierarchicalHypergraphPooling(nn.Module):
         self.node_assign = nn.Linear(hidden_dim, pooled_nodes)
         self.edge_assign = nn.Linear(hidden_dim, pooled_edges)
 
-    def forward(self, node_tokens: torch.Tensor, edge_tokens: torch.Tensor, incidence: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(self, node_tokens, edge_tokens, incidence):
         if node_tokens.numel() == 0 or edge_tokens.numel() == 0:
             return node_tokens, edge_tokens, incidence
-        # Keep the incidence sparse: pooled_incidence = s_node^T @ I @ s_edge,
-        # computed as (dense[P,N] @ sparse[N,E]) @ dense[E,P] -> [P,P], never
-        # materialising the dense [N,E] incidence matrix.
         sp = incidence if incidence.is_sparse else incidence.to_sparse_coo()
         sp = sp.coalesce()
         s_node = torch.softmax(self.node_assign(node_tokens), dim=1)
         s_edge = torch.softmax(self.edge_assign(edge_tokens), dim=1)
         pooled_nodes = s_node.transpose(0, 1) @ node_tokens
         pooled_edges = s_edge.transpose(0, 1) @ edge_tokens
-        # sp is sparse; autocast(bf16) would cast it to BFloat16 and CUDA
-        # sparse kernels reject that dtype, so force float32 here.
         with torch.autocast(device_type=sp.device.type, enabled=False):
-            pooled_incidence = (s_node.transpose(0, 1) @ sp) @ s_edge
+            # Use sparse @ dense (supported) instead of dense @ sparse (not supported
+            # in this torch build): (Pn x N) @ ((N x Ne) @ (Ne x Pe)) = (Pn x Pe).
+            pooled_incidence = (s_node.transpose(0, 1)) @ (sp @ s_edge)
         return (
             torch.nan_to_num(pooled_nodes, nan=0.0, posinf=0.0, neginf=0.0),
             torch.nan_to_num(pooled_edges, nan=0.0, posinf=0.0, neginf=0.0),
@@ -789,7 +637,7 @@ class EncoderLayer(nn.Module):
             max_k=config.max_k,
         )
 
-    def forward(self, node_tokens: torch.Tensor, edge_tokens: torch.Tensor, incidence: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(self, node_tokens, edge_tokens, incidence):
         node_tokens, topk_index = self.sparse_attn(node_tokens, edge_tokens, incidence)
         node_tokens, edge_tokens = self.dual_attn(node_tokens, edge_tokens, incidence)
         return node_tokens, edge_tokens, topk_index
