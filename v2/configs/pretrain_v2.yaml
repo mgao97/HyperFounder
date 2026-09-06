@@ -1,0 +1,74 @@
+# v2 domain-agnostic pretraining — strict match encoder-design-spec.md (2026-09-01)
+model:
+  input_dim: 128
+  hidden_dim: 256
+  dropout: 0.1
+  num_layers: 3
+  num_heads: 4
+  # --- new per mentor spec §3-§5 ---
+  pe_dim: 32
+  hca_topk: 16
+  use_hor: true
+
+training:
+  seed: 7
+  device: cuda
+  epochs: 60
+  steps_per_epoch: 32
+  lr: 0.001
+  weight_decay: 0.0001
+  # --- pretext augmentation knobs (§5) ---
+  edge_mlm_mask_rate: 0.15
+  membership_num_negatives: 4
+  membership_hard_prob: 0.7
+  dualview_node_drop: 0.15
+  dualview_edge_drop: 0.10
+  tau_membership: 0.2
+  tau_edge_dualview: 0.5
+  # --- heads ---
+  edge_mlm_recon: true
+  membership_bilinear: true
+  edge_dualview_proj_dim: 128
+  # --- Kendall homoscedastic UW (3 params) ---
+  use_kendall_uw: true
+  # (legacy slot for baseline tuning with fixed scalar weights, ignored if use_kendall_uw=true)
+  loss_weights:
+    edge_mlm: 1.0
+    membership_contrast: 1.0
+    edge_dualview_contrast: 1.0
+  # --- runtime ---
+  feat_dropout: 0.15
+  output_dir: outputs_v2
+  grad_clip_norm: 1.0
+  amp:
+    # encoder body forces float32 (sparse matmul + scatter), keep amp disabled unless strictly needed
+    enabled: false
+    dtype: float32
+  early_stopping:
+    patience: 12
+  minibatch:
+    max_nodes: 512
+    max_edges: 256
+    expansion_hops: 2
+    seed_edges_per_subhypergraph: 3
+    min_subgraph_nodes: 64
+
+data:
+  datasets:
+    - cora_cc
+    - citeseer_cc
+    - pubmed_cc
+    - coauthorship_dblp
+    - cooking_200
+    - gowalla
+  domain_map:
+    cora_cc: citation
+    citeseer_cc: citation
+    pubmed_cc: citation
+    coauthorship_dblp: academic
+    cooking_200: document
+    gowalla: recommendation
+  cache_dir: data/cache
+  splits:
+    train_ratio: 0.6
+    val_ratio: 0.2

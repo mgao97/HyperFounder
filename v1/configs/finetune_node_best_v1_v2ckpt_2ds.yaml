@@ -1,0 +1,60 @@
+data:
+  datasets:
+    - cora_cc
+    - citeseer_cc
+  domain_map:
+    cora_cc: citation
+    citeseer_cc: citation
+  load_features: true
+  max_nodes: 64
+  max_edges: 64
+  max_membership_hop: 2
+  use_motifs: false
+  use_communities: false
+  use_cross_scale: false
+  normalize_features: false
+  feature_type: numerical
+
+model:
+  # 128 == DHG Cocitation* feature dim; aligns with pretrain_neg_sam_v2 / _cc split
+  input_dim: 128
+  hidden_dim: 128
+  spectral_dim: 0
+  # match original finetune_neg_sam_v2.yaml so v2 ckpt weights load correctly
+  structure_pe_dim: 8
+  num_layers: 4
+  num_heads: 8
+  dropout: 0.3
+  topk: 16
+  pooled_nodes: 64
+  pooled_edges: 32
+  max_k: 512
+  use_domain_adapter: true
+  adapter_type: adapter
+  adapter_dim: 32
+  num_experts: 4
+  num_domains: 4
+  # shared off -> use raw node_emb (equivalent to original Ours); verifies v1 code
+  use_shared_for_downstream: false
+
+training:
+  task_name: node
+  device: cuda
+  seed: 7
+  num_seeds: 3
+  # match original finetune_neg_sam_v2.yaml
+  finetune_epochs: 1000
+  lr: 0.001
+  weight_decay: 0.0005
+  early_stopping:
+    patience: 50
+  log_interval_epochs: 10
+  val_check_interval: 5
+  batch_size: 1
+  use_fp16: false
+  output_dir: outputs_neg_sam_v1_v2ckpt
+  # original Ours checkpoint (4-domain pretrain) for fair comparison
+  pretrained_checkpoint: outputs_neg_sam_v2/checkpoints/pretrain_last_neg_sam.pt
+
+outputs:
+  root: outputs_neg_sam_v1_v2ckpt

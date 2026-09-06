@@ -1,0 +1,46 @@
+
+data:
+  # name: cora
+  # name: pubmed
+  # name: citeseer
+  # name: news20
+  # name: coauthorship_cora
+  # name: coauthorship_dblp
+  # name: dblp4k-conf
+  name: dblp4k-paper
+  # name: dblp4k-term
+  # name: cocitation_cora
+  # name: imdb4k
+  num_train: 20
+  num_val: 100
+  ft_noise_level: 0.0
+  hc_noise_level: 1.0
+
+model: 
+  # teacher: gcn
+  teacher: hgnn
+  # teacher: hgnnp
+  # teacher: hnhn
+  # teacher: unigcn
+  # teacher: unigat
+  # student: dis_hgnn
+  student: dis_hgnnp
+  hid: 128
+
+loss:
+  lamb: 0
+  tau: 1.0
+
+wd: /home2/fengyifan/code/DisHGNN
+data_marker: ${data.name}__${data.num_train}-${data.num_val}__noise-${data.ft_noise_level}-${data.hc_noise_level}
+model_marker: ${model.teacher}-${model.student}__hid-${model.hid}
+loss_marker: lamb-${loss.lamb}__tau-${loss.tau}
+task: ${data_marker}__${model_marker}__${loss_marker}
+res_path: ${wd}/cache/trans/${task}
+
+hydra:
+  run:
+    dir: ${res_path}/${now:%Y-%m-%d}_${now:%H-%M-%S}
+  sweep:
+    dir: ${res_path}/${now:%Y-%m-%d}_${now:%H-%M-%S}
+    subdir: ${hydra.job.num}

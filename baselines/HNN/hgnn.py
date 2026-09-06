@@ -72,13 +72,18 @@ class HypergraphConv(MessagePassing):
 
         alpha = None
         if self.use_attention:
-            assert num_edges <= num_edges
-            x = x.view(-1, self.heads, self.out_channels)
-            x_i, x_j = x[hyperedge_index[0]], x[hyperedge_index[1]]
-            alpha = (torch.cat([x_i, x_j], dim=-1) * self.att).sum(dim=-1)
+            # Node self-attention over the members of each hyperedge.
+            # x is [N, heads*out] here; view to [N, heads, out] and index by
+            # NODE (hyperedge_index[0]) -- hyperedge_index[1] are edge ids and
+            # must NOT be used to index node features.
+            x3 = x.view(-1, self.heads, self.out_channels)
+            x_i = x3[hyperedge_index[0]]                                   # [nnz, heads, out]
+            alpha = (x_i * self.att[:, :, :self.out_channels]).sum(dim=-1)  # [nnz, heads]
             alpha = F.leaky_relu(alpha, self.negative_slope)
-            alpha = softmax(alpha, hyperedge_index[0], num_nodes=x.size(0))
+            # softmax over the nodes within each hyperedge (group by edge id)
+            alpha = softmax(alpha, hyperedge_index[1], num_nodes=num_edges)
             alpha = F.dropout(alpha, p=self.dropout, training=self.training)
+            x = x3
 
         if not self.symdegnorm:
             D = scatter_add(hyperedge_weight[hyperedge_index[1]],
@@ -95,7 +100,7 @@ class HypergraphConv(MessagePassing):
             edge_embed = self.propagate(hyperedge_index, x=x, norm=B, alpha=alpha,
                                  size=(num_nodes, num_edges))
             self.flow = 'target_to_source'
-            out = self.propagate(hyperedge_index, x=edge_embed, norm=D, alpha=alpha,size=(num_nodes, num_edges))
+            out = self.propagate(hyperedge_index, x=edge_embed, norm=D, alpha=None,size=(num_nodes, num_edges))
             
         else:  # this correspond to HGNN
             D = scatter_add(hyperedge_weight[hyperedge_index[1]],
@@ -108,13 +113,13 @@ class HypergraphConv(MessagePassing):
             B = 1.0 / B
             B[B == float("inf")] = 0
 
-            x = D.unsqueeze(-1)*x
+            x = D.view(-1, *([1] * (x.dim() - 1))) * x
             self.flow = 'source_to_target'
             edge_embed = self.propagate(hyperedge_index, x=x, norm=B, alpha=alpha,
                                  size=(num_nodes, num_edges))
 
             self.flow = 'target_to_source'
-            out = self.propagate(hyperedge_index,x=edge_embed, norm=D, alpha=alpha,size=(num_nodes, num_edges))
+            out = self.propagate(hyperedge_index,x=edge_embed, norm=D, alpha=None,size=(num_nodes, num_edges))
 
         if self.concat is True:
             out = out.view(-1, self.heads * self.out_channels)
